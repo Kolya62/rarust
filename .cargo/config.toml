@@ -1,0 +1,11 @@
+# Windows builds link C runtime and unwinder statically, so rarust.exe
+# does not depend on DLLs missing in standard Windows installation.
+[target.x86_64-pc-windows-gnullvm]
+# Clang does not use -no-pie passed by rustc for this target.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-Wno-unused-command-line-argument"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

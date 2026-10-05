@@ -1,0 +1,20 @@
+[package]
+name = "rarust"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, dependency-free RAR extractor written in Rust"
+rust-version = "1.87"
+license = "MPL-2.0"
+
+[lib]
+name = "rarust"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rarust"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
