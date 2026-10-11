@@ -30,6 +30,7 @@ pub mod list;
 pub mod loclang;
 pub mod matchfn;
 pub mod motw;
+pub mod parallel;
 pub mod pathfn;
 pub mod rawread;
 pub mod rdwrfn;

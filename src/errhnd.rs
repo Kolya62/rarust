@@ -60,6 +60,22 @@ pub fn clean() {
     });
 }
 
+/// Exit code and error count, saved to undo errors of a trial operation.
+pub fn error_state() -> (i32, u32) {
+    EH.with(|e| {
+        let e = e.borrow();
+        (e.exit_code, e.err_count)
+    })
+}
+
+pub fn restore_error_state(state: (i32, u32)) {
+    EH.with(|e| {
+        let mut e = e.borrow_mut();
+        e.exit_code = state.0;
+        e.err_count = state.1;
+    })
+}
+
 pub fn set_silent(mode: bool) {
     EH.with(|e| e.borrow_mut().silent = mode);
 }
@@ -77,6 +93,7 @@ pub fn get_error_count() -> u32 {
 }
 
 pub fn set_error_code(code: i32) {
+    crate::consio::capture_event(crate::consio::CapturedEvent::ErrorCode(code));
     EH.with(|e| {
         let mut e = e.borrow_mut();
         match code {

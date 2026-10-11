@@ -109,13 +109,19 @@ fn log(s: &str) {
     eprintf(s);
 }
 
+pub fn sound_on() -> bool {
+    SOUND_ON.with(|s| s.get())
+}
+
 pub fn ui_init(sound: bool) {
     SOUND_ON.with(|s| s.set(sound));
 }
 
 pub fn ui_msg(m: UiMsg) {
     use UiMsg::*;
-    ANY_MESSAGE_DISPLAYED.with(|a| a.set(true));
+    if !crate::consio::capture_event(crate::consio::CapturedEvent::MessageShown) {
+        ANY_MESSAGE_DISPLAYED.with(|a| a.set(true));
+    }
     match m {
         SysErrMsg(s) | GeneralErrMsg(s) => log(&wfmt!("\n%s", s)),
         IncErrCount => {}
@@ -264,7 +270,14 @@ pub fn ui_alarm(_t: UiAlarm) {
     }
 }
 
+pub fn set_message_displayed() {
+    ANY_MESSAGE_DISPLAYED.with(|a| a.set(true));
+}
+
 pub fn ui_eol_after_msg() {
+    if crate::consio::capture_event(crate::consio::CapturedEvent::EolAfterMessage) {
+        return;
+    }
     if ANY_MESSAGE_DISPLAYED.with(|a| a.get()) {
         ANY_MESSAGE_DISPLAYED.with(|a| a.set(false));
         mprintf("\n");

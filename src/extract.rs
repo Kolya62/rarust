@@ -305,7 +305,17 @@ impl CmdExtract {
             arc.seek(self.analyze.start_pos as i64, SEEK_SET);
             self.analyze.start_pos = 0;
         }
-        loop {
+        let plan = {
+            let c = self.cmd.borrow();
+            crate::parallel::plan(&c, &mut arc, c0)
+        };
+        let mut proceed = true;
+        if let Some(plan) = plan {
+            proceed = self.extract_parallel(&mut arc, &plan);
+            // Continue with the end of archive header sequentially.
+            arc.seek(plan.end_pos, SEEK_SET);
+        }
+        while proceed {
             let size = arc.read_header();
             let mut repeat = false;
             if !self.extract_current_file(&mut arc, size, &mut repeat) {
@@ -316,7 +326,7 @@ impl CmdExtract {
                     }
                     return ExtractArcCode::Repeat;
                 }
-                break;
+                proceed = false;
             }
         }
         let (test, del_arc) = {
@@ -332,6 +342,113 @@ impl CmdExtract {
             self.delete_archive(&mut arc, &n);
         }
         ExtractArcCode::Next
+    }
+
+    /// Process a file header and its service headers at the given positions.
+    fn process_group(&mut self, arc: &mut Archive, headers: &[i64]) -> bool {
+        for &pos in headers {
+            arc.seek(pos, SEEK_SET);
+            let size = arc.read_header();
+            let mut repeat = false;
+            if !self.extract_current_file(arc, size, &mut repeat) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Extract files of a non-solid archive in parallel. Returns false if
+    /// extraction of the archive must stop, like extract_current_file.
+    fn extract_parallel(&mut self, arc: &mut Archive, plan: &crate::parallel::Plan) -> bool {
+        use crate::parallel::{fatal_code, LiveGuard, Shared, ThreadSettings};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+        let settings = ThreadSettings::current();
+        let cmd_data = self.cmd.borrow().clone();
+        let inner_threads = (cmd_data.threads / plan.workers as u32).max(1);
+        let arc_name = arc.file_name().to_string();
+        let (total_size, processed_size) = (self.data_io.total_arc_size, self.data_io.processed_arc_size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Shared {
+            plan,
+            next: AtomicUsize::new(0),
+            abort: AtomicBool::new(false),
+            live: AtomicUsize::new(plan.workers),
+            results: tx,
+        };
+        let mut proceed = true;
+        let mut fatal = None;
+        let mut counters = Vec::new();
+        crate::filefn::set_parallel_dirs(true);
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..plan.workers {
+                let (shared, cmd_data, arc_name) = (&shared, cmd_data.clone(), arc_name.clone());
+                handles.push(s.spawn(move || {
+                    let _guard = LiveGuard(&shared.live);
+                    extract_worker(shared, cmd_data, inner_threads, &arc_name, settings, total_size, processed_size)
+                }));
+            }
+            let mut pending = std::collections::BTreeMap::new();
+            let mut i = 0;
+            while i < plan.groups.len() {
+                let group = &plan.groups[i];
+                let result = if group.main_thread {
+                    None
+                } else if let Some(r) = pending.remove(&i) {
+                    Some(r)
+                } else {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok((j, r)) => {
+                            pending.insert(j, r);
+                            continue;
+                        }
+                        // Workers could not open the archive or stopped,
+                        // so process the group here.
+                        Err(_) if shared.live.load(Ordering::SeqCst) == 0 && shared.next.load(Ordering::SeqCst) <= i => None,
+                        Err(_) => continue,
+                    }
+                };
+                match result {
+                    Some(r) => {
+                        crate::consio::replay(r.events);
+                        if r.fatal.is_some() {
+                            fatal = r.fatal;
+                            break;
+                        }
+                        if !r.proceed {
+                            proceed = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        if !self.process_group(arc, &group.headers) {
+                            proceed = false;
+                            break;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            shared.abort.store(true, Ordering::SeqCst);
+            for h in handles {
+                match h.join() {
+                    Ok(c) => counters.push(c),
+                    Err(e) => fatal = fatal.or(Some(fatal_code(&*e))),
+                }
+            }
+        });
+        crate::filefn::set_parallel_dirs(false);
+        for c in counters {
+            self.total_file_count += c.total_file_count;
+            self.file_count += c.file_count;
+            self.matched_args += c.matched_args;
+            self.suppress_no_files_message |= c.suppress_no_files_message;
+        }
+        if let Some(code) = fatal {
+            std::panic::resume_unwind(Box::new(errhnd::RarExit(code)));
+        }
+        proceed
     }
 
     fn delete_archive(&mut self, arc: &mut Archive, arc_name: &str) {
@@ -1072,8 +1189,7 @@ impl CmdExtract {
         }
         if md == MkdirCode::Success {
             if !c.disable_names {
-                mprintf(&wfmt!(MCreatDir, self.dest_file_name.as_str()));
-                mprintf(&wfmt!(" %s", MOk));
+                dir_created_msg(&self.dest_file_name);
             }
             if cfg!(unix) && !c.ignore_general_attr {
                 set_file_attr(&self.dest_file_name, file_attr);
@@ -1315,4 +1431,58 @@ impl CmdExtract {
         }
         true
     }
+}
+
+/// Worker thread of parallel extraction. Takes groups from the shared queue
+/// and sends their recorded console output to the main thread.
+fn extract_worker(
+    shared: &crate::parallel::Shared,
+    mut cmd_data: crate::cmddata::CommandData,
+    threads: u32,
+    arc_name: &str,
+    settings: crate::parallel::ThreadSettings,
+    total_size: i64,
+    processed_size: i64,
+) -> crate::parallel::Counters {
+    use crate::parallel::{fatal_code, Counters, GroupResult};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    settings.apply();
+    cmd_data.threads = threads;
+    let cmd: CmdRef = std::rc::Rc::new(std::cell::RefCell::new(cmd_data));
+    let mut counters = Counters::default();
+    // Messages issued when opening the archive were already shown by the
+    // main thread.
+    crate::consio::capture_start();
+    let opened = catch_unwind(AssertUnwindSafe(|| {
+        let mut arc = Archive::new(cmd.clone());
+        (arc.w_open(arc_name) && arc.is_archive(true)).then_some(arc)
+    }));
+    crate::consio::capture_take();
+    let mut arc = match opened {
+        Ok(Some(a)) => a,
+        _ => return counters,
+    };
+    let mut ex = CmdExtract::new(cmd.clone());
+    ex.arc_name = arc_name.to_string();
+    ex.extract_archive_init(&mut arc);
+    ex.data_io.total_arc_size = total_size;
+    ex.data_io.processed_arc_size = processed_size;
+    while let Some(i) = shared.take() {
+        crate::consio::capture_start();
+        let r = catch_unwind(AssertUnwindSafe(|| ex.process_group(&mut arc, &shared.plan.groups[i].headers)));
+        let events = crate::consio::capture_take();
+        let (proceed, fatal) = match r {
+            Ok(p) => (p, None),
+            Err(e) => (false, Some(fatal_code(&*e))),
+        };
+        let _ = shared.results.send((i, GroupResult { events, proceed, fatal }));
+        if fatal.is_some() || !proceed {
+            break;
+        }
+    }
+    counters.total_file_count = ex.total_file_count;
+    counters.file_count = ex.file_count;
+    counters.matched_args = ex.matched_args;
+    counters.suppress_no_files_message = ex.suppress_no_files_message;
+    counters
 }

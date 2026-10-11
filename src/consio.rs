@@ -58,7 +58,69 @@ fn stdin_redirected() -> bool {
     !std::io::stdin().is_terminal()
 }
 
+/// Console event recorded by a worker thread, replayed by the main thread
+/// in archive order.
+#[derive(Debug, Clone)]
+pub enum CapturedEvent {
+    Out(bool, String),
+    ErrorCode(i32),
+    MessageShown,
+    EolAfterMessage,
+    /// Directory creation message, shown once per directory.
+    DirCreated(String, String),
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<Vec<CapturedEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start recording console output and error events of the current thread.
+pub fn capture_start() {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop recording and return recorded events.
+pub fn capture_take() -> Vec<CapturedEvent> {
+    CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default()
+}
+
+/// Record an event if capturing. Returns false if not capturing.
+pub fn capture_event(e: CapturedEvent) -> bool {
+    CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(e);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Print recorded events and apply recorded error codes.
+pub fn replay(events: Vec<CapturedEvent>) {
+    for e in events {
+        match e {
+            CapturedEvent::Out(to_stderr, s) => {
+                if to_stderr {
+                    let _ = std::io::stdout().flush();
+                }
+                out(to_stderr, &s)
+            }
+            CapturedEvent::ErrorCode(code) => errhnd::set_error_code(code),
+            CapturedEvent::MessageShown => crate::ui::set_message_displayed(),
+            CapturedEvent::EolAfterMessage => crate::ui::ui_eol_after_msg(),
+            CapturedEvent::DirCreated(dir, text) => crate::filefn::announce_dir(&dir, &text),
+        }
+    }
+}
+
+pub fn is_input_prohibited() -> bool {
+    PROHIBIT_INPUT.with(|p| p.get())
+}
+
 fn out(to_stderr: bool, s: &str) {
+    if capture_event(CapturedEvent::Out(to_stderr, s.to_string())) {
+        return;
+    }
     OUTPUT_PRESENT.with(|p| p.set(true));
     let s = replace_esc(s);
     if to_stderr {

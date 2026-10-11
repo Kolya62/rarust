@@ -20,7 +20,85 @@ pub enum MkdirCode {
 
 pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
+/// Directories created during parallel extraction, and directories for
+/// which the creation message was already shown. Active only while
+/// workers extract files, None otherwise.
+static PARALLEL_DIRS: std::sync::Mutex<Option<(std::collections::HashSet<String>, std::collections::HashSet<String>)>> =
+    std::sync::Mutex::new(None);
+
+fn parallel_dirs() -> std::sync::MutexGuard<'static, Option<(std::collections::HashSet<String>, std::collections::HashSet<String>)>> {
+    PARALLEL_DIRS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Start or stop tracking directories created by parallel extraction.
+pub fn set_parallel_dirs(active: bool) {
+    *parallel_dirs() = if active { Some(Default::default()) } else { None };
+}
+
+/// Show "Creating directory" message. In parallel extraction the message
+/// is shown only once, for the first file in archive order needing the
+/// directory, like in sequential extraction.
+pub fn dir_created_msg(dir: &str) {
+    let m = crate::consio::get_console_msg_stream();
+    if m == crate::consio::MessageType::Null || m == crate::consio::MessageType::ErrOnly {
+        return;
+    }
+    let text = wfmt!(MCreatDir, dir) + &wfmt!(" %s", MOk);
+    if crate::consio::capture_event(crate::consio::CapturedEvent::DirCreated(dir.to_string(), text.clone())) {
+        return;
+    }
+    announce_dir(dir, &text);
+}
+
+/// Print directory creation message unless already shown in parallel mode.
+pub fn announce_dir(dir: &str, text: &str) {
+    if let Some((_, shown)) = parallel_dirs().as_mut() {
+        if !shown.insert(dir.to_string()) {
+            return;
+        }
+    }
+    crate::consio::mprintf(text);
+}
+
+/// In parallel extraction, report parent directories of `path` created
+/// during extraction. A file created without creating its parents may still
+/// be the first file in archive order needing them.
+pub fn announce_parents(path: &str) {
+    let found: Vec<String> = {
+        let dirs = parallel_dirs();
+        let Some((created, _)) = dirs.as_ref() else {
+            return;
+        };
+        let v = chars(path);
+        (1..v.len())
+            .filter(|&i| is_path_div(v[i]))
+            .map(|i| v[..i].iter().collect::<String>())
+            .filter(|d| created.contains(d))
+            .collect()
+    };
+    for d in found {
+        dir_created_msg(&d);
+    }
+}
+
 pub fn make_dir(name: &str, set_attr: bool, attr: u32) -> MkdirCode {
+    let mut dirs = parallel_dirs();
+    if let Some((created, _)) = dirs.as_mut() {
+        // Report directories created by other workers as created here, so
+        // every file reports them as if extracted sequentially.
+        let r = make_dir_raw(name, set_attr, attr);
+        if r == MkdirCode::Success {
+            created.insert(name.to_string());
+        } else if created.contains(name) {
+            return MkdirCode::Success;
+        }
+        return r;
+    }
+    drop(dirs);
+    make_dir_raw(name, set_attr, attr)
+}
+
+fn make_dir_raw(name: &str, set_attr: bool, attr: u32) -> MkdirCode {
     #[allow(unused_mut)]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -67,8 +145,7 @@ pub fn create_path(path: &str, skip_last_name: bool, silent: bool) -> bool {
             let dir: String = v[..i].iter().collect();
             success = make_dir(&dir, true, dir_attr) == MkdirCode::Success;
             if success && !silent {
-                crate::consio::mprintf(&wfmt!(MCreatDir, dir));
-                crate::consio::mprintf(&wfmt!(" %s", MOk));
+                dir_created_msg(&dir);
             }
         }
     }

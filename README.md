@@ -46,7 +46,8 @@ All OK
 |---|---|
 | **Archive formats** | RAR 1.4, RAR 1.5–4.x, RAR 5.0 / 7.0, self-extracting (SFX) archives |
 | **Compression** | RAR 1.5, 2.x (incl. audio), 3.x (LZ, PPMd, VM filters), 5.0/7.0 (E8, E8E9, ARM, Delta filters) |
-| **Dictionaries** | Up to 1 TB (RAR 7), multithreaded RAR 5 decoding |
+| **Dictionaries** | Up to 1 TB (RAR 7) |
+| **Multithreading** | Parallel extraction of non-solid archives of any version, multithreaded RAR 5 decoding, AES and BLAKE2sp |
 | **Encryption** | RAR 1.3, 1.5, 2.0, AES-128 (RAR 3.x), AES-256 (RAR 5.0), encrypted headers, password check values |
 | **Integrity** | CRC32, BLAKE2sp, checksum MACs for encrypted files |
 | **Volumes** | Multivolume archives with new (`.partN.rar`) and old (`.rNN`) naming |
@@ -63,6 +64,9 @@ Highlights:
   and all decompressors are implemented in the crate itself.
 - **Tested.** Verified on hundreds of archives created by different RAR
   versions: listings, test results, exit codes and extracted files.
+- **Multicore.** Files of non-solid archives are extracted in parallel for
+  every RAR version, including RAR 1.5–4.x, with the same output order and
+  exit codes as sequential extraction. Use `-mt1` to extract sequentially.
 - **Robust.** Fuzzed with corrupted archives: no panics and no hangs.
 - **Minimal unsafe code.** Only operating system calls in two small modules,
   `src/win32.rs` and `src/unixsig.rs`. Everything else is safe Rust.
@@ -146,7 +150,7 @@ Run `rarust` without parameters for the full list of switches.
 
 ## Building
 
-Requires Rust 1.87 or newer.
+Requires Rust 1.88 or newer.
 
 ```bash
 cargo build --release            # Linux and other Unix systems

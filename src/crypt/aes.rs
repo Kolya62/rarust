@@ -201,17 +201,99 @@ impl Aes {
         }
     }
 
-    /// CBC decrypt whole 16 byte blocks in place.
-    pub fn cbc_decrypt(&mut self, data: &mut [u8]) {
-        for chunk in data.as_chunks_mut::<16>().0 {
+    /// Decrypt 4 independent blocks. Interleaving them lets the processor
+    /// execute table lookups of different blocks in parallel.
+    fn decrypt_block4(&self, b: &mut [[u8; 16]; 4]) {
+        let k = &self.dec_key;
+        let mut s = [[0u32; 4]; 4];
+        for j in 0..4 {
+            for c in 0..4 {
+                s[j][c] = u32::from_le_bytes(b[j][c * 4..c * 4 + 4].try_into().unwrap()) ^ k[c];
+            }
+        }
+        for r in 1..self.rounds {
+            let mut t = [[0u32; 4]; 4];
+            for j in 0..4 {
+                for c in 0..4 {
+                    t[j][c] = TD[(s[j][c] & 0xff) as usize]
+                        ^ TD[((s[j][(c + 3) % 4] >> 8) & 0xff) as usize].rotate_left(8)
+                        ^ TD[((s[j][(c + 2) % 4] >> 16) & 0xff) as usize].rotate_left(16)
+                        ^ TD[(s[j][(c + 1) % 4] >> 24) as usize].rotate_left(24)
+                        ^ k[r * 4 + c];
+                }
+            }
+            s = t;
+        }
+        for j in 0..4 {
+            for c in 0..4 {
+                let v = (INV_SBOX[(s[j][c] & 0xff) as usize] as u32)
+                    | ((INV_SBOX[((s[j][(c + 3) % 4] >> 8) & 0xff) as usize] as u32) << 8)
+                    | ((INV_SBOX[((s[j][(c + 2) % 4] >> 16) & 0xff) as usize] as u32) << 16)
+                    | ((INV_SBOX[(s[j][(c + 1) % 4] >> 24) as usize] as u32) << 24);
+                b[j][c * 4..c * 4 + 4].copy_from_slice(&(v ^ k[self.rounds * 4 + c]).to_le_bytes());
+            }
+        }
+    }
+
+    /// CBC decrypt whole 16 byte blocks with the given initialization vector.
+    fn cbc_decrypt_with(&self, data: &mut [u8], mut iv: [u8; 16]) -> [u8; 16] {
+        let (quads, rest) = data.as_chunks_mut::<64>();
+        for q in quads {
+            let ct: [u8; 64] = *q;
+            let mut b = [[0u8; 16]; 4];
+            for j in 0..4 {
+                b[j].copy_from_slice(&ct[j * 16..j * 16 + 16]);
+            }
+            self.decrypt_block4(&mut b);
+            for j in 0..4 {
+                let prev = if j == 0 { iv } else { ct[j * 16 - 16..j * 16].try_into().unwrap() };
+                for i in 0..16 {
+                    q[j * 16 + i] = b[j][i] ^ prev[i];
+                }
+            }
+            iv = ct[48..64].try_into().unwrap();
+        }
+        for chunk in rest.as_chunks_mut::<16>().0 {
             let ct: [u8; 16] = *chunk;
             let mut b = ct;
             self.decrypt_block(&mut b);
             for i in 0..16 {
-                chunk[i] = b[i] ^ self.iv[i];
+                chunk[i] = b[i] ^ iv[i];
             }
-            self.iv = ct;
+            iv = ct;
         }
+        iv
+    }
+
+    /// CBC decrypt whole 16 byte blocks in place. Every block depends only
+    /// on the previous ciphertext block, so large buffers are split between
+    /// processor cores.
+    pub fn cbc_decrypt(&mut self, data: &mut [u8]) {
+        const MIN_PART: usize = 256 * 1024;
+        let len = data.len() & !15;
+        let data = &mut data[..len];
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
+        if threads < 2 || len < 2 * MIN_PART {
+            self.iv = self.cbc_decrypt_with(data, self.iv);
+            return;
+        }
+        let parts = threads.min(len / MIN_PART);
+        let part_len = (len / parts + 15) & !15;
+        // Initialization vectors of parts are the last ciphertext blocks of
+        // previous parts, take them before decrypting.
+        let mut ivs = vec![self.iv];
+        for p in 1..parts {
+            let pos = p * part_len;
+            ivs.push(data[pos - 16..pos].try_into().unwrap());
+        }
+        let last_iv: [u8; 16] = data[len - 16..].try_into().unwrap();
+        let this = &*self;
+        std::thread::scope(|s| {
+            for (chunk, iv) in data.chunks_mut(part_len).zip(ivs) {
+                s.spawn(move || this.cbc_decrypt_with(chunk, iv));
+            }
+        });
+        self.iv = last_iv;
     }
 }
 
@@ -240,6 +322,22 @@ mod tests {
         assert_eq!(SBOX[1], 124);
         assert_eq!(SBOX[255], 22);
     }
+    #[test]
+    fn cbc_large_matches_blockwise() {
+        let key = [5u8; 32];
+        let iv = [9u8; 16];
+        let plain: Vec<u8> = (0..(3 << 20) + 48).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut enc = plain.clone();
+        Aes::new(&key, Some(&iv)).cbc_encrypt(&mut enc);
+        // Decrypt in uneven pieces, so both paths and IV chaining are used.
+        let mut a = Aes::new(&key, Some(&iv));
+        let mut dec = enc.clone();
+        let (x, y) = dec.split_at_mut(1 << 20 | 32);
+        a.cbc_decrypt(x);
+        a.cbc_decrypt(y);
+        assert!(dec == plain);
+    }
+
     #[test]
     fn cbc() {
         check(

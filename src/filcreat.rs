@@ -113,6 +113,9 @@ pub fn file_create(cmd: &mut CommandData, new_file: Option<&mut File>, name: &mu
     match new_file {
         Some(f) => {
             if f.create(name, mode) {
+                if !cmd.disable_names {
+                    announce_parents(name);
+                }
                 return (true, false);
             }
             create_path(name, true, cmd.disable_names);

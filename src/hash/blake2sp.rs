@@ -171,11 +171,24 @@ impl Blake2sp {
         }
         let stripe = PAR * BLOCK;
         let full = data.len() - data.len() % stripe;
-        for (i, st) in self.s.iter_mut().enumerate() {
+        let lane = |i: usize, st: &mut Blake2s| {
             let mut off = i * BLOCK;
             while off + BLOCK <= full {
                 st.update(&data[off..off + BLOCK]);
                 off += stripe;
+            }
+        };
+        // Lanes are independent, so large data is hashed by several threads.
+        const MIN_PARALLEL: usize = 1 << 20;
+        if full >= MIN_PARALLEL && std::thread::available_parallelism().map(|n| n.get() > 1).unwrap_or(false) {
+            std::thread::scope(|sc| {
+                for (i, st) in self.s.iter_mut().enumerate() {
+                    sc.spawn(move || lane(i, st));
+                }
+            });
+        } else {
+            for (i, st) in self.s.iter_mut().enumerate() {
+                lane(i, st);
             }
         }
         let rest = &data[full..];
@@ -215,6 +228,18 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn large_parallel_equals_chunked() {
+        let data: Vec<u8> = (0..(3u32 << 20) + 77).map(|i| (i * 13 + i / 97) as u8).collect();
+        let mut whole = Blake2sp::new();
+        whole.update(&data);
+        let mut parts = Blake2sp::new();
+        for c in data.chunks(1000) {
+            parts.update(c);
+        }
+        assert_eq!(whole.finalize(), parts.finalize());
+    }
+
     #[test]
     fn chunked_equals_whole() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();

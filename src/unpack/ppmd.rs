@@ -1062,6 +1062,33 @@ impl ModelPPM {
         }
         self.prev_success = 0;
         let mut i = self.ns(ctx) as i32 - 1;
+        // Fast path: scan frequencies in one slice of the state array.
+        if i >= 1 {
+            let first = p as usize + STATE_SIZE as usize;
+            if let Some(st) = self.sa.heap.get(first..first + i as usize * STATE_SIZE as usize) {
+                let mut found = false;
+                for s in st.as_chunks::<{ STATE_SIZE as usize }>().0 {
+                    p += STATE_SIZE;
+                    hi_cnt += s[1] as i32;
+                    if hi_cnt > count {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    self.coder.high_count = hi_cnt as u32;
+                    self.coder.low_count = (hi_cnt - self.freq(p) as i32) as u32;
+                    self.update1(ctx, p);
+                    return true;
+                }
+                // All states scanned without a match. Step back one state,
+                // so the loop below rescans the last one and takes the
+                // escape branch with the same state as before.
+                hi_cnt -= self.freq(p) as i32;
+                p -= STATE_SIZE;
+                i = 1;
+            }
+        }
         loop {
             p += STATE_SIZE;
             hi_cnt += self.freq(p) as i32;
@@ -1128,7 +1155,8 @@ impl ModelPPM {
         }
         let mut i = ns - self.num_masked;
         let psee2c = self.make_esc_freq2(ctx, i);
-        let mut ps: Vec<u32> = Vec::with_capacity(256);
+        let mut ps = [0u32; 256];
+        let mut ps_len = 0usize;
         let stats = self.stats(ctx);
         let end = stats + ns as u32 * STATE_SIZE;
         let mut p = stats.wrapping_sub(STATE_SIZE);
@@ -1144,10 +1172,11 @@ impl ModelPPM {
                 }
             }
             hi_cnt += self.freq(p) as i32;
-            if ps.len() >= 256 {
+            if ps_len >= 256 {
                 return false;
             }
-            ps.push(p);
+            ps[ps_len] = p;
+            ps_len += 1;
             i -= 1;
             if i <= 0 {
                 break;
@@ -1168,7 +1197,7 @@ impl ModelPPM {
                     break;
                 }
                 k += 1;
-                if k >= ps.len() {
+                if k >= ps_len {
                     return false;
                 }
                 p = ps[k];
@@ -1181,7 +1210,7 @@ impl ModelPPM {
             self.coder.low_count = hi_cnt as u32;
             self.coder.high_count = self.coder.scale;
             let n = (ns - self.num_masked) as usize;
-            for &q in ps.iter().take(n) {
+            for &q in ps[..ps_len].iter().take(n) {
                 self.char_mask[self.sym(q) as usize] = self.esc_count;
             }
             let sc = self.coder.scale as u16;
