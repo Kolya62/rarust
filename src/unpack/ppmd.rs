@@ -473,8 +473,8 @@ pub struct ModelPPM {
     prev_success: u8,
     hi_bits_flag: u8,
     bin_summ: Box<[[u16; 64]; 128]>,
-    /// Positions of unmasked states found by decode_symbol2.
-    ps: [u8; 256],
+    /// Unmasked states found by decode_symbol2.
+    ps: [u32; 256],
     coder: RangeCoder,
     sa: SubAllocator,
     error: bool,
@@ -1117,13 +1117,17 @@ impl ModelPPM {
     fn decode_bin_symbol(&mut self, ctx: u32) {
         let rs = Self::one_state(ctx);
         self.hi_bits_flag = self.hb2flag[self.sym(self.found_state) as usize & 0xff];
-        let rs_freq = self.freq(rs);
-        let suffix_ns = self.ns(self.suffix(ctx));
+        // OneState symbol and frequency, Suffix.
+        let (rs_sym, rs_freq, suffix) = match self.sa.heap.get(ctx as usize..ctx as usize + UNIT_SIZE as usize) {
+            Some(h) => (h[2] as u32, h[3] as u32, u32::from_le_bytes([h[8], h[9], h[10], h[11]])),
+            None => (self.sym(rs), self.freq(rs), self.suffix(ctx)),
+        };
+        let suffix_ns = self.ns(suffix);
         let i1 = (rs_freq.wrapping_sub(1) & 127) as usize;
         let i2 = (self.prev_success as u32
             + self.ns2bsindx[(suffix_ns.wrapping_sub(1) & 0xff) as usize] as u32
             + self.hi_bits_flag as u32
-            + 2 * self.hb2flag[self.sym(rs) as usize] as u32
+            + 2 * self.hb2flag[rs_sym as usize] as u32
             + ((self.run_length >> 26) & 0x20) as u32) as usize
             & 63;
         let bs = self.bin_summ[i1][i2] as u32;
@@ -1145,7 +1149,7 @@ impl ModelPPM {
             const EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
             self.init_esc = EXP_ESCAPE[(nbs >> 10) as usize & 15] as i32;
             self.num_masked = 1;
-            self.char_mask[self.sym(rs) as usize] = self.esc_count;
+            self.char_mask[rs_sym as usize] = self.esc_count;
             self.prev_success = 0;
             self.found_state = 0;
         }
@@ -1201,6 +1205,63 @@ impl ModelPPM {
     }
 
     fn decode_symbol1(&mut self, ctx: u32) -> bool {
+        let (ns, summ, stats) = self.ctx_head(ctx);
+        let n = ns as usize;
+        let a = stats as usize;
+        if n < 2 || self.sa.heap.get(a..a + n * STATE_SIZE as usize).is_none() {
+            return self.decode_symbol1_slow(ctx);
+        }
+        self.coder.scale = summ;
+        let count = self.current_count();
+        if count >= summ as i32 {
+            return false;
+        }
+        let st = &self.sa.heap[a..a + n * STATE_SIZE as usize];
+        let st = st.as_chunks::<{ STATE_SIZE as usize }>().0;
+        let mut hi_cnt = st[0][1] as i32;
+        if count < hi_cnt {
+            self.coder.high_count = hi_cnt as u32;
+            self.prev_success = (2 * hi_cnt as u32 > summ) as u8;
+            self.run_length += self.prev_success as i32;
+            self.found_state = stats;
+            hi_cnt += 4;
+            self.sa.heap[a + 1] = hi_cnt as u8;
+            self.set_summ_freq(ctx, summ + 4);
+            if hi_cnt as u32 > MAX_FREQ {
+                self.rescale(ctx);
+            }
+            self.coder.low_count = 0;
+            return true;
+        } else if self.found_state == 0 {
+            return false;
+        }
+        self.prev_success = 0;
+        for k in 1..n {
+            let f = st[k][1] as i32;
+            hi_cnt += f;
+            if hi_cnt > count {
+                self.coder.high_count = hi_cnt as u32;
+                self.coder.low_count = (hi_cnt - f) as u32;
+                self.update1(ctx, stats + k as u32 * STATE_SIZE);
+                return true;
+            }
+        }
+        // Escape: mask all symbols of this context.
+        self.hi_bits_flag = self.hb2flag[self.sym(self.found_state) as usize];
+        self.coder.low_count = hi_cnt as u32;
+        let st = &self.sa.heap[a..a + n * STATE_SIZE as usize];
+        let esc = self.esc_count;
+        for s in st.as_chunks::<{ STATE_SIZE as usize }>().0 {
+            self.char_mask[s[0] as usize] = esc;
+        }
+        self.num_masked = ns as i32;
+        self.found_state = 0;
+        self.coder.high_count = self.coder.scale;
+        true
+    }
+
+    #[cold]
+    fn decode_symbol1_slow(&mut self, ctx: u32) -> bool {
         self.coder.scale = self.summ_freq(ctx);
         let mut p = self.stats(ctx);
         let count = self.current_count();
@@ -1321,65 +1382,59 @@ impl ModelPPM {
         let want = (ns - self.num_masked).max(1) as usize;
         let psee2c = self.make_esc_freq2(ctx, ns - self.num_masked);
         let stats = self.stats(ctx) as usize;
-        // Positions of unmasked states in the state array.
+        let len = ns as usize * STATE_SIZE as usize;
+        let Some(st) = self.sa.heap.get(stats..stats + len) else {
+            return false;
+        };
+        // Cumulative frequency of unmasked states shifted left by 8 bits,
+        // with the state position in lower 8 bits.
         let mut n = 0;
         let mut hi_cnt: u32 = 0;
         {
-            let st = match self.sa.heap.get(stats..stats + ns as usize * STATE_SIZE as usize) {
-                Some(st) => st,
-                None => return false,
-            };
             let esc = self.esc_count;
             let mask = &self.char_mask;
             let ps = &mut self.ps;
             // Branchless, because masked and unmasked states alternate
-            // unpredictably.
+            // unpredictably. States are scanned up to the end, as normally
+            // exactly 'want' of them are unmasked.
             for (k, s) in st.as_chunks::<{ STATE_SIZE as usize }>().0.iter().enumerate() {
-                let unmasked = (mask[s[0] as usize] != esc) as usize;
-                ps[n & 0xff] = k as u8;
-                hi_cnt += s[1] as u32 & (unmasked as u32).wrapping_neg();
-                n += unmasked;
-                if n == want {
-                    break;
-                }
+                let unmasked = (mask[s[0] as usize] != esc) as u32;
+                hi_cnt += s[1] as u32 & unmasked.wrapping_neg();
+                ps[n & 0xff] = hi_cnt << 8 | k as u32;
+                n += unmasked as usize;
             }
         }
-        if n < want {
-            return false;
+        if n != want {
+            // Symbols of a child context can be missing in this context
+            // after rescaling. The model uses first 'want' unmasked states
+            // then.
+            if n < want {
+                return false;
+            }
+            n = want;
+            hi_cnt = self.ps[n - 1] >> 8;
         }
         self.coder.scale = self.coder.scale.wrapping_add(hi_cnt);
         let count = self.current_count();
         if count >= self.coder.scale as i32 {
             return false;
         }
+        let ps = &self.ps[..n];
         if count < hi_cnt as i32 {
-            let st = &self.sa.heap[stats..stats + ns as usize * STATE_SIZE as usize];
-            let mut acc = 0u32;
-            let mut k = 0;
-            loop {
-                let pos = self.ps[k] as usize * STATE_SIZE as usize;
-                let f = st[pos + 1] as u32;
-                acc += f;
-                if acc as i32 > count {
-                    self.coder.high_count = acc;
-                    self.coder.low_count = acc - f;
-                    break;
-                }
-                k += 1;
-                if k >= n {
-                    return false;
-                }
-            }
-            let p = stats as u32 + self.ps[k] as u32 * STATE_SIZE;
+            // First state with cumulative frequency exceeding count.
+            let j = if count < 0 { 0 } else { ps.partition_point(|&e| (e >> 8) as i32 <= count) };
+            self.coder.high_count = ps[j] >> 8;
+            self.coder.low_count = if j == 0 { 0 } else { ps[j - 1] >> 8 };
+            let p = stats as u32 + (ps[j] & 0xff) * STATE_SIZE;
             self.see2[psee2c].update();
             self.update2(ctx, p);
         } else {
             self.coder.low_count = hi_cnt;
             self.coder.high_count = self.coder.scale;
-            let st = &self.sa.heap[stats..stats + ns as usize * STATE_SIZE as usize];
+            let st = &self.sa.heap[stats..stats + len];
             let esc = self.esc_count;
-            for &k in &self.ps[..n] {
-                self.char_mask[st[k as usize * STATE_SIZE as usize] as usize] = esc;
+            for &e in ps {
+                self.char_mask[st[(e & 0xff) as usize * STATE_SIZE as usize] as usize] = esc;
             }
             let sc = self.coder.scale as u16;
             self.see2[psee2c].summ = self.see2[psee2c].summ.wrapping_add(sc);

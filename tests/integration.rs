@@ -4,7 +4,8 @@
 
 //! Integration tests: run the rarust command on fixture archives.
 //! Fixtures g4_* and g5_* were created by RAR 6.24 and 7.23 from the
-//! files in tests/data/src.
+//! files in tests/data/src. ppmd_restart.rar was made by a PPMd encoder
+//! written for testing and verified with unrar 7.00.
 
 use std::path::{Path, PathBuf};
 
@@ -120,4 +121,52 @@ fn listing() {
     for a in GEN {
         assert_eq!(run(&["lt", "-ppass", &arc(a)]), 0, "{}", a);
     }
+}
+
+/// Data of ppmd_restart.rar, made by xorshift32 generator: pseudo words and
+/// biased random bytes.
+fn xorshift(x: &mut u32) -> u32 {
+    *x ^= *x << 13;
+    *x ^= *x >> 17;
+    *x ^= *x << 5;
+    *x
+}
+
+fn ppmd_text(n: usize) -> Vec<u8> {
+    const SYL: [&str; 32] = [
+        "ka", "lo", "mi", "nu", "re", "sa", "to", "vi", "ber", "dan", "fol", "gim", "hur", "jes", "kol", "lum", "mar", "nos",
+        "pil", "quo", "ras", "sel", "tun", "ulm", "vor", "wex", "yal", "zen", "ab", "ef", "ix", "ou",
+    ];
+    let mut x = 0x12345678;
+    let mut out = Vec::new();
+    while out.len() < n {
+        for _ in 0..1 + xorshift(&mut x) % 3 {
+            out.extend_from_slice(SYL[(xorshift(&mut x) % 32) as usize].as_bytes());
+        }
+        out.push(if xorshift(&mut x) % 16 == 0 { b'\n' } else { b' ' });
+    }
+    out.truncate(n);
+    out
+}
+
+fn ppmd_binary(n: usize) -> Vec<u8> {
+    let mut x = 0x9e3779b9;
+    (0..n)
+        .map(|_| {
+            let v = xorshift(&mut x);
+            (v & 0x3f) as u8 | if v & 0x300 == 0 { 0x80 } else { 0 }
+        })
+        .collect()
+}
+
+/// PPMd order 64 with 1 MB of memory: the model memory is exhausted, so
+/// free blocks are glued and the model is restarted several times.
+#[test]
+fn ppmd_model_restart() {
+    let d = tmp_dir("ppmd");
+    let dest = format!("{}/", d.display());
+    assert_eq!(run(&["x", "-y", &arc("ppmd_restart.rar"), &dest]), 0);
+    assert!(std::fs::read(d.join("ppm_text.txt")).unwrap() == ppmd_text(200000));
+    assert!(std::fs::read(d.join("ppm_bin.dat")).unwrap() == ppmd_binary(30000));
+    let _ = std::fs::remove_dir_all(&d);
 }
