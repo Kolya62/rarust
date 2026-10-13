@@ -66,7 +66,9 @@ Highlights:
   versions: listings, test results, exit codes and extracted files.
 - **Multicore.** Files of non-solid archives are extracted in parallel for
   every RAR version, including RAR 1.5–4.x, with the same output order and
-  exit codes as sequential extraction. Use `-mt1` to extract sequentially.
+  exit codes as sequential extraction. Files smaller than 32 KB are
+  extracted by the main thread, because file system operations dominate
+  for them. Use `-mt1` to extract sequentially.
 - **Robust.** Fuzzed with corrupted archives: no panics and no hangs.
 - **Minimal unsafe code.** Only operating system calls in two small modules,
   `src/win32.rs` and `src/unixsig.rs`. Everything else is safe Rust.
@@ -227,7 +229,11 @@ cargo test --release
   descriptor validation, reparse point data.
 - Integration tests in `tests/` on archives created by RAR 6 and RAR 7:
   compression methods, solid and encrypted archives, volumes, recovery
-  volumes, comments, links and Unicode names.
+  volumes, comments, links and Unicode names. PPMd model restart is tested
+  on an archive with the model memory exhausted.
+- Hostile archives built at test time (`tests/crafted.rs`): `..` names,
+  links pointing outside of destination, Windows absolute links and files
+  with the same destination in parallel extraction.
 
 ## License
 
