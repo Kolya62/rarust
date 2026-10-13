@@ -294,10 +294,8 @@ fn calc_allowed_depth(name: &str) -> i32 {
     let v = chars(name);
     let mut depth = 0;
     for i in 0..v.len() {
-        if is_path_div(v[i]) {
-            if is_path_div(at(&v, i + 1)) {
-                return 0;
-            }
+        // Trailing and repeated separators do not add depth.
+        if is_path_div(v[i]) && at(&v, i + 1) != '\0' && !is_path_div(at(&v, i + 1)) {
             let dot = at(&v, i + 1) == '.' && (is_path_div(at(&v, i + 2)) || at(&v, i + 2) == '\0');
             let dot2 = at(&v, i + 1) == '.' && at(&v, i + 2) == '.' && (is_path_div(at(&v, i + 3)) || at(&v, i + 3) == '\0');
             if !dot && !dot2 {
@@ -442,8 +440,10 @@ fn extract_unix_link30(cmd: &CommandData, io: &mut ComprDataIO, arc: &mut Archiv
 fn extract_unix_link50(cmd: &CommandData, name: &str, hd: &FileHeader) -> bool {
     let mut target = wide_to_char(&hd.redir_name);
     if hd.redir_type == FsRedir::WinSymlink || hd.redir_type == FsRedir::Junction {
+        // Windows absolute path links, such as \??\C:\dir, cannot be created
+        // in Unix. Only relative Windows links are converted.
         if target.starts_with(b"\\??\\") || target.starts_with(b"/??/") {
-            target.drain(..4);
+            return false;
         }
         for b in target.iter_mut() {
             if *b == b'\\' {
@@ -652,5 +652,22 @@ pub fn get_stream_name_ntfs(arc: &Archive) -> String {
         crate::unicode::raw_to_wide(&arc.sub_head.sub_data)
     } else {
         crate::unicode::utf_to_wide(&arc.sub_head.sub_data)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn allowed_depth() {
+        assert_eq!(calc_allowed_depth("lnk"), 0);
+        assert_eq!(calc_allowed_depth("a/lnk"), 1);
+        assert_eq!(calc_allowed_depth("a/b/lnk"), 2);
+        assert_eq!(calc_allowed_depth("a/"), 0);
+        assert_eq!(calc_allowed_depth("a//b/lnk"), 2);
+        assert_eq!(calc_allowed_depth("a/./lnk"), 1);
+        assert_eq!(calc_allowed_depth("a/../lnk"), 0);
+        // Leading ".." are removed from the destination name.
+        assert_eq!(calc_allowed_depth("../../a/lnk"), 1);
     }
 }

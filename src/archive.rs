@@ -1892,7 +1892,7 @@ impl Archive {
         let size_bytes = raw.get_vsize(4);
         let block_size = raw.getv();
         let mut size_to_read = block_size as i64 - (FIRST as i64 - size_bytes as i64 - 4);
-        if size_to_read < 0 || size_bytes == 0 || block_size == 0 {
+        if size_to_read < 0 || size_bytes == 0 || block_size == 0 || block_size > MAX_HEADER_SIZE_RAR5 as u64 {
             self.qopen.loaded = false;
             return false;
         }

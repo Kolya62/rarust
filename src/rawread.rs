@@ -125,7 +125,7 @@ impl RawRead {
 
     /// Copy `field.len()` bytes, zero filling the rest. Returns copied size.
     pub fn getb(&mut self, field: &mut [u8]) -> usize {
-        let copy = (self.data_size - self.read_pos).min(field.len());
+        let copy = self.data_size.saturating_sub(self.read_pos).min(field.len());
         field[..copy].copy_from_slice(&self.data[self.read_pos..self.read_pos + copy]);
         for b in &mut field[copy..] {
             *b = 0;

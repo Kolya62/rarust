@@ -321,16 +321,25 @@ impl File {
                 self.error_type = FileErrorType::ReadError;
                 if !self.no_exceptions {
                     if self.read_error_mode == ReadErrorMode::Ignore {
+                        // Read the rest in small blocks, replacing unreadable
+                        // blocks with zeros.
                         read_size = 0;
                         let size = buf.len();
-                        let mut i = 0;
+                        let mut i = off;
                         while i < size {
                             self.seek(file_pos + i as i64, SEEK_SET);
                             let n = (size - i).min(512);
                             let code = self.direct_read(&mut buf[i..i + n]);
-                            read_size += if code == -1 { 512 } else { code };
-                            total += read_size;
-                            i += 512;
+                            if code == -1 {
+                                buf[i..i + n].fill(0);
+                                read_size += n as i32;
+                            } else {
+                                read_size += code;
+                                if (code as usize) < n {
+                                    break;
+                                }
+                            }
+                            i += n;
                         }
                     } else {
                         let mut ignore = false;

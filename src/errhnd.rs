@@ -351,12 +351,16 @@ pub fn wait() {
 /// fatal errors. Returns the final error code.
 pub fn run_catching<F: FnOnce()>(f: F) -> i32 {
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if info.payload().downcast_ref::<RarExit>().is_none() {
-            prev(info);
-        }
-    }));
+    // Install the hook once, so repeated calls do not chain hooks.
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<RarExit>().is_none() {
+                prev(info);
+            }
+        }));
+    });
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(()) => {}
         Err(e) => {

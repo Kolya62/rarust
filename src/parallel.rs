@@ -18,7 +18,7 @@ use crate::cmddata::{CommandData, OverwriteMode};
 use crate::consio::{self, CapturedEvent};
 use crate::errhnd::{self, RarExit, RARX_FATAL};
 use crate::headers::*;
-use crate::pathfn::{is_wildcard, point_to_name};
+use crate::pathfn::{convert_path, is_path_div, is_wildcard, point_to_name};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -96,12 +96,67 @@ pub fn plan(cmd: &CommandData, arc: &mut Archive, command: char) -> Option<Plan>
     }
 }
 
+/// Destination path of archived name split to lowercase components,
+/// without "." components and dangerous prefixes, so names like "a/./b",
+/// "x/../a/b" and "A/B" give the same key.
+fn dest_key(name: &str, flat: bool) -> Vec<String> {
+    let (_, conv) = convert_path(name);
+    let conv = if flat { point_to_name(&conv) } else { conv.as_str() };
+    conv.split(is_path_div)
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(|c| {
+            let c = c.to_lowercase();
+            // Windows ignores trailing dots and spaces in names.
+            if cfg!(windows) {
+                c.trim_end_matches(['.', ' ']).to_string()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Destination paths seen in the archive. Files must be extracted in archive
+/// order if they have the same destination or if one of them is a folder
+/// containing another.
+#[derive(Default)]
+struct DestNames {
+    files: HashSet<Vec<String>>,
+    dirs: HashSet<Vec<String>>,
+}
+
+impl DestNames {
+    /// Add a name. Returns false on conflict with already added names.
+    fn add(&mut self, key: Vec<String>, dir: bool) -> bool {
+        for i in 1..key.len() {
+            let parent = &key[..i];
+            if self.files.contains(parent) {
+                return false;
+            }
+            self.dirs.insert(parent.to_vec());
+        }
+        if dir {
+            !self.files.contains(&key) && {
+                self.dirs.insert(key);
+                true
+            }
+        } else {
+            !self.dirs.contains(&key) && self.files.insert(key)
+        }
+    }
+}
+
 fn scan(cmd: &CommandData, arc: &mut Archive, command: char) -> Option<Plan> {
     let mut groups: Vec<Group> = Vec::new();
-    let mut names = HashSet::new();
+    let mut names = DestNames::default();
     let mut max_window = 0u64;
     let mut end_pos;
-    let flat_names = command == 'E' || cmd.excl_path != crate::cmddata::PathExclMode::Unchanged;
+    // Name transformations other than path removal are not tracked, so
+    // compare only names without path for them.
+    let flat_names = command == 'E'
+        || cmd.excl_path != crate::cmddata::PathExclMode::Unchanged
+        || !cmd.arc_path.is_empty()
+        || !cmd.excl_arc_path.is_empty();
     loop {
         // Where sequential processing continues after parallel extraction:
         // the end of archive header or the place where headers end.
@@ -129,13 +184,12 @@ fn scan(cmd: &CommandData, arc: &mut Archive, command: char) -> Option<Plan> {
             if h.encrypted && !cmd.password_set() {
                 return None;
             }
+            // Files with the same destination name must be processed in
+            // archive order.
+            if !names.add(dest_key(&h.file_name, flat_names), h.dir) {
+                return None;
+            }
             if !h.dir {
-                // Files with the same destination name must be processed in
-                // archive order.
-                let key = if flat_names { point_to_name(&h.file_name).to_string() } else { h.file_name.clone() };
-                if !names.insert(key.to_lowercase()) {
-                    return None;
-                }
                 max_window = max_window.max(h.win_size);
             }
             groups.push(Group { headers: vec![pos], main_thread: h.dir });
@@ -230,3 +284,23 @@ impl Shared<'_> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dest_names() {
+        assert_eq!(dest_key("a/./b", false), dest_key("x/../a/b", false));
+        assert_eq!(dest_key("A/B", false), dest_key("a/b", false));
+        assert_eq!(dest_key("a//b", false), dest_key("a/b", false));
+        assert_eq!(dest_key("dir/b", true), dest_key("b", true));
+        let mut n = DestNames::default();
+        assert!(n.add(dest_key("a/b", false), false));
+        assert!(n.add(dest_key("a/c", false), false));
+        assert!(n.add(dest_key("a", false), true));
+        assert!(!n.add(dest_key("./a/b", false), false));
+        assert!(!n.add(dest_key("a", false), false));
+        assert!(!n.add(dest_key("a/b/c", false), false));
+        assert!(!n.add(dest_key("a/b", false), true));
+    }
+}

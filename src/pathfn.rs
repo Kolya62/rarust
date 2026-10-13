@@ -112,7 +112,12 @@ pub fn convert_path(src: &str) -> (usize, String) {
         }
         dest_pos = i;
     }
-    let dest_pos = dest_pos.min(s.len());
+    let mut dest_pos = dest_pos.min(s.len());
+    // Code above does not remove the last "..", like in a name consisting
+    // of ".." only. Such name would refer to the parent of destination.
+    if s.len() - dest_pos == 2 && s[dest_pos] == '.' && s[dest_pos + 1] == '.' {
+        dest_pos += 2;
+    }
     (dest_pos, s[dest_pos..].iter().collect())
 }
 
@@ -739,5 +744,12 @@ mod tests {
         assert_eq!(convert_path("../../a/b").1, "a/b");
         assert_eq!(convert_path("/abs/x").1, "abs/x");
         assert_eq!(convert_path("a/../b").1, "b");
+        assert_eq!(convert_path("..").1, "");
+        assert_eq!(convert_path("./..").1, "");
+        assert_eq!(convert_path("../").1, "");
+        assert_eq!(convert_path("/..").1, "");
+        assert_eq!(convert_path("..a").1, "..a");
+        assert_eq!(convert_path("a..").1, "a..");
+        assert_eq!(convert_path("...").1, "...");
     }
 }
