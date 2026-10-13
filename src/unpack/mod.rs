@@ -218,7 +218,7 @@ pub struct Unpack {
     // Unpack v3.0.
     prev_low_dist: i32,
     low_dist_rep_count: i32,
-    ppm: Option<Box<ppmd::ModelPPM>>,
+    ppm: Box<ppmd::ModelPPM>,
     ppm_esc_char: i32,
     unp_old_table: [u8; HUFF_TABLE_SIZE30],
     unp_block_ppm: bool,
@@ -240,6 +240,81 @@ pub struct Unpack {
     pub max_win_size: usize,
     pub max_win_mask: usize,
     pub extra_dist: bool,
+}
+
+/// Fill the input buffer, moving unprocessed data to its beginning.
+fn read_buf(
+    inp: &mut BitInput,
+    read_top: &mut i64,
+    read_border: &mut i64,
+    block_header: &mut UnpackBlockHeader,
+    io: &mut dyn UnpackIo,
+) -> bool {
+    let mut data_size = *read_top - inp.in_addr as i64;
+    if data_size < 0 {
+        return false;
+    }
+    block_header.block_size -= inp.in_addr as i64 - block_header.block_start;
+    if inp.in_addr > MAX_SIZE / 2 {
+        if data_size > 0 {
+            let a = inp.in_addr;
+            inp.in_buf.copy_within(a..a + data_size as usize, 0);
+        }
+        inp.in_addr = 0;
+        *read_top = data_size;
+    } else {
+        data_size = *read_top;
+    }
+    let mut read_code = 0;
+    if MAX_SIZE as i64 != data_size {
+        let ds = data_size as usize;
+        read_code = io.unp_read(&mut inp.in_buf[ds..MAX_SIZE]);
+    }
+    if read_code > 0 {
+        *read_top += read_code as i64;
+    }
+    *read_border = *read_top - 30;
+    block_header.block_start = inp.in_addr as i64;
+    if block_header.block_size != -1 {
+        *read_border = (*read_border).min(block_header.block_start + block_header.block_size - 1);
+    }
+    read_code != -1
+}
+
+/// Byte input of PPM decoder: the bit input buffer of Unpack, refilled
+/// from packed data when needed.
+struct PpmInput<'a> {
+    inp: &'a mut BitInput,
+    read_top: &'a mut i64,
+    read_border: &'a mut i64,
+    block_header: &'a mut UnpackBlockHeader,
+    io: &'a mut dyn UnpackIo,
+}
+
+impl PpmInput<'_> {
+    #[cold]
+    #[inline(never)]
+    fn refill_byte(&mut self) -> u8 {
+        read_buf(self.inp, self.read_top, self.read_border, self.block_header, self.io);
+        let a = self.inp.in_addr;
+        if a >= MAX_SIZE {
+            return 0;
+        }
+        self.inp.in_addr = a + 1;
+        self.inp.in_buf[a]
+    }
+}
+
+impl ppmd::ByteReader for PpmInput<'_> {
+    #[inline(always)]
+    fn byte(&mut self) -> u8 {
+        let a = self.inp.in_addr;
+        if a > MAX_SIZE - 30 {
+            return self.refill_byte();
+        }
+        self.inp.in_addr = a + 1;
+        self.inp.in_buf[a]
+    }
 }
 
 impl Default for Unpack {
@@ -304,7 +379,7 @@ impl Unpack {
             aud_v: [AudioVariables::default(); 4],
             prev_low_dist: 0,
             low_dist_rep_count: 0,
-            ppm: Some(Box::default()),
+            ppm: Box::default(),
             ppm_esc_char: 0,
             unp_old_table: [0; HUFF_TABLE_SIZE30],
             unp_block_ppm: false,
@@ -581,50 +656,9 @@ impl Unpack {
         length
     }
 
-    /// Get a byte from input buffer, used by PPM decoder.
-    fn get_char(&mut self, io: &mut dyn UnpackIo) -> u8 {
-        if self.inp.in_addr > MAX_SIZE - 30 {
-            self.unp_read_buf(io);
-            if self.inp.in_addr >= MAX_SIZE {
-                return 0;
-            }
-        }
-        let c = self.inp.in_buf[self.inp.in_addr];
-        self.inp.in_addr += 1;
-        c
-    }
-
     /// Fill the input buffer (RAR 5.0 version, also used for RAR 1.5-2.x).
     fn unp_read_buf(&mut self, io: &mut dyn UnpackIo) -> bool {
-        let mut data_size = self.read_top - self.inp.in_addr as i64;
-        if data_size < 0 {
-            return false;
-        }
-        self.block_header.block_size -= self.inp.in_addr as i64 - self.block_header.block_start;
-        if self.inp.in_addr > MAX_SIZE / 2 {
-            if data_size > 0 {
-                let a = self.inp.in_addr;
-                self.inp.in_buf.copy_within(a..a + data_size as usize, 0);
-            }
-            self.inp.in_addr = 0;
-            self.read_top = data_size;
-        } else {
-            data_size = self.read_top;
-        }
-        let mut read_code = 0;
-        if MAX_SIZE as i64 != data_size {
-            let ds = data_size as usize;
-            read_code = io.unp_read(&mut self.inp.in_buf[ds..MAX_SIZE]);
-        }
-        if read_code > 0 {
-            self.read_top += read_code as i64;
-        }
-        self.read_border = self.read_top - 30;
-        self.block_header.block_start = self.inp.in_addr as i64;
-        if self.block_header.block_size != -1 {
-            self.read_border = self.read_border.min(self.block_header.block_start + self.block_header.block_size - 1);
-        }
-        read_code != -1
+        read_buf(&mut self.inp, &mut self.read_top, &mut self.read_border, &mut self.block_header, io)
     }
 
     fn unp_write_area(&mut self, start: usize, end: usize, io: &mut dyn UnpackIo) {

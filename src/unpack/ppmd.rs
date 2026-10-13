@@ -41,6 +41,8 @@ struct SubAllocator {
     lo_unit: u32,
     hi_unit: u32,
     free_list: [u32; N_INDEXES],
+    /// Bit i is set if free_list[i] is not empty.
+    free_mask: u64,
     p_text: u32,
     units_start: u32,
     heap_end: u32,
@@ -59,6 +61,7 @@ impl Default for SubAllocator {
             lo_unit: 0,
             hi_unit: 0,
             free_list: [0; N_INDEXES],
+            free_mask: 0,
             p_text: 0,
             units_start: 0,
             heap_end: 0,
@@ -119,11 +122,18 @@ impl SubAllocator {
         let n = self.free_list[indx];
         self.set_u32(p, n);
         self.free_list[indx] = p;
+        if p != 0 {
+            self.free_mask |= 1 << indx;
+        }
     }
 
     fn remove_node(&mut self, indx: usize) -> u32 {
         let r = self.free_list[indx];
-        self.free_list[indx] = self.u32_(r);
+        let next = self.u32_(r);
+        self.free_list[indx] = next;
+        if next == 0 {
+            self.free_mask &= !(1 << indx);
+        }
         r
     }
 
@@ -169,6 +179,7 @@ impl SubAllocator {
 
     fn init(&mut self) {
         self.free_list = [0; N_INDEXES];
+        self.free_mask = 0;
         self.p_text = self.heap_start;
         let size2 = FIXED_UNIT_SIZE * (self.size / 8 / FIXED_UNIT_SIZE * 7);
         let real_size2 = size2 / FIXED_UNIT_SIZE * UNIT_SIZE;
@@ -313,24 +324,20 @@ impl SubAllocator {
                 return self.remove_node(indx);
             }
         }
-        let mut i = indx;
-        loop {
-            i += 1;
-            if i == N_INDEXES {
-                self.glue_count = self.glue_count.wrapping_sub(1);
-                let bi = Self::u2b(self.indx2units[indx] as u32);
-                let j = FIXED_UNIT_SIZE * self.indx2units[indx] as u32;
-                if self.fake_units_start as i64 - self.p_text as i64 > j as i64 {
-                    self.fake_units_start -= j;
-                    self.units_start -= bi;
-                    return self.units_start;
-                }
-                return 0;
+        // First non-empty list of larger blocks.
+        let larger = self.free_mask.checked_shr(indx as u32 + 1).unwrap_or(0);
+        if larger == 0 {
+            self.glue_count = self.glue_count.wrapping_sub(1);
+            let bi = Self::u2b(self.indx2units[indx] as u32);
+            let j = FIXED_UNIT_SIZE * self.indx2units[indx] as u32;
+            if self.fake_units_start as i64 - self.p_text as i64 > j as i64 {
+                self.fake_units_start -= j;
+                self.units_start -= bi;
+                return self.units_start;
             }
-            if self.free_list[i] != 0 {
-                break;
-            }
+            return 0;
         }
+        let i = indx + 1 + larger.trailing_zeros() as usize;
         let r = self.remove_node(i);
         self.split_block(r, i, indx);
         r
@@ -448,7 +455,7 @@ struct RangeCoder {
 const DUMMY_SEE2: usize = 25 * 16;
 
 pub struct ModelPPM {
-    see2: Vec<See2Context>, // 25*16 + dummy
+    see2: Box<[See2Context; DUMMY_SEE2 + 1]>,
     min_context: u32,
     max_context: u32,
     found_state: u32,
@@ -465,7 +472,9 @@ pub struct ModelPPM {
     esc_count: u8,
     prev_success: u8,
     hi_bits_flag: u8,
-    bin_summ: Vec<[u16; 64]>,
+    bin_summ: Box<[[u16; 64]; 128]>,
+    /// Positions of unmasked states found by decode_symbol2.
+    ps: [u8; 256],
     coder: RangeCoder,
     sa: SubAllocator,
     error: bool,
@@ -474,7 +483,7 @@ pub struct ModelPPM {
 impl Default for ModelPPM {
     fn default() -> Self {
         ModelPPM {
-            see2: vec![See2Context::default(); 25 * 16 + 1],
+            see2: Box::new([See2Context::default(); DUMMY_SEE2 + 1]),
             min_context: 0,
             max_context: 0,
             found_state: 0,
@@ -491,7 +500,8 @@ impl Default for ModelPPM {
             esc_count: 0,
             prev_success: 0,
             hi_bits_flag: 0,
-            bin_summ: vec![[0; 64]; 128],
+            bin_summ: Box::new([[0; 64]; 128]),
+            ps: [0; 256],
             coder: RangeCoder::default(),
             sa: SubAllocator::default(),
             error: false,
@@ -499,7 +509,10 @@ impl Default for ModelPPM {
     }
 }
 
-type Reader<'a> = &'a mut dyn FnMut() -> u8;
+/// Source of packed bytes for the range decoder.
+pub trait ByteReader {
+    fn byte(&mut self) -> u8;
+}
 
 impl ModelPPM {
     // Context accessors.
@@ -559,6 +572,60 @@ impl ModelPPM {
         let y = self.get_state(b);
         self.put_state(a, y);
         self.put_state(b, x);
+    }
+
+    /// NumStats, SummFreq and Stats fields of context, read at once.
+    #[inline(always)]
+    fn ctx_head(&self, c: u32) -> (u32, u32, u32) {
+        let c = c as usize;
+        match self.sa.heap.get(c..c + 8) {
+            Some(h) => (
+                u16::from_le_bytes([h[0], h[1]]) as u32,
+                u16::from_le_bytes([h[2], h[3]]) as u32,
+                u32::from_le_bytes([h[4], h[5], h[6], h[7]]),
+            ),
+            None => (0, 0, 0),
+        }
+    }
+
+    /// Write NumStats, SummFreq and Stats fields of context at once.
+    /// Values are truncated to field sizes.
+    #[inline(always)]
+    fn set_ctx_head(&mut self, c: u32, ns: u32, summ: u32, stats: u32) {
+        let c = c as usize;
+        if let Some(h) = self.sa.heap.get_mut(c..c + 8) {
+            h[0..2].copy_from_slice(&(ns as u16).to_le_bytes());
+            h[2..4].copy_from_slice(&(summ as u16).to_le_bytes());
+            h[4..8].copy_from_slice(&stats.to_le_bytes());
+        }
+    }
+
+    /// Find state with the symbol, scanning states starting from `stats`.
+    /// Like the original pointer loop, the scan can continue beyond NumStats
+    /// if the symbol is missing, up to 257 states.
+    #[inline(always)]
+    fn find_state(&self, stats: u32, ns: u32, sym: u32) -> Option<u32> {
+        let a = stats as usize;
+        if let Some(st) = self.sa.heap.get(a..a + ns as usize * STATE_SIZE as usize) {
+            if let Some(k) = st.as_chunks::<{ STATE_SIZE as usize }>().0.iter().position(|s| s[0] as u32 == sym) {
+                return Some(stats + k as u32 * STATE_SIZE);
+            }
+        }
+        self.find_state_slow(stats, sym)
+    }
+
+    #[cold]
+    fn find_state_slow(&self, stats: u32, sym: u32) -> Option<u32> {
+        let mut p = stats;
+        let mut guard = 0;
+        while self.sym(p) != sym {
+            p += STATE_SIZE;
+            guard += 1;
+            if guard > 256 {
+                return None;
+            }
+        }
+        Some(p)
     }
 
     fn create_child(&mut self, ctx: u32, p_stats: u32, first: State) -> u32 {
@@ -650,6 +717,98 @@ impl ModelPPM {
     }
 
     fn rescale(&mut self, ctx: u32) {
+        let (old_ns, _, stats) = self.ctx_head(ctx);
+        let fs = self.found_state;
+        let n = old_ns as usize;
+        let k = fs.wrapping_sub(stats) as usize / STATE_SIZE as usize;
+        let len = n * STATE_SIZE as usize;
+        let fast = n >= 2
+            && fs >= stats
+            && (fs - stats).is_multiple_of(STATE_SIZE)
+            && k < n
+            && self.sa.heap.get(stats as usize..stats as usize + len).is_some();
+        if !fast {
+            self.rescale_slow(ctx);
+            return;
+        }
+        let adder = (self.order_fall != 0) as u8;
+        let (_, summ0, _) = self.ctx_head(ctx);
+        let st_bytes = &mut self.sa.heap[stats as usize..stats as usize + len];
+        let st = st_bytes.as_chunks_mut::<{ STATE_SIZE as usize }>().0;
+        // Move the found state to the front.
+        st[..=k].rotate_right(1);
+        st[0][1] = st[0][1].wrapping_add(4);
+        let mut esc_freq = (summ0 + 4) as i32 - st[0][1] as i32;
+        let nf = (st[0][1] as u32 + adder as u32) >> 1;
+        st[0][1] = nf as u8;
+        let mut summ = nf;
+        for j in 1..n {
+            esc_freq -= st[j][1] as i32;
+            let nf = (st[j][1] as u32 + adder as u32) >> 1;
+            st[j][1] = nf as u8;
+            summ += nf;
+            if st[j][1] > st[j - 1][1] {
+                // Keep states sorted by frequency.
+                let tmp = st[j];
+                let mut p1 = j;
+                loop {
+                    st[p1] = st[p1 - 1];
+                    p1 -= 1;
+                    if p1 == 0 || tmp[1] <= st[p1 - 1][1] {
+                        break;
+                    }
+                }
+                st[p1] = tmp;
+            }
+        }
+        let mut ns = old_ns;
+        if st[n - 1][1] == 0 {
+            // Remove states with zero frequency.
+            let mut i = 0;
+            let mut p = n - 1;
+            loop {
+                i += 1;
+                p -= 1;
+                if st[p][1] != 0 || p == 0 {
+                    break;
+                }
+            }
+            esc_freq += i;
+            ns = old_ns - i as u32;
+            if ns == 1 {
+                let mut tmp = st[0];
+                loop {
+                    tmp[1] -= tmp[1] >> 1;
+                    esc_freq >>= 1;
+                    if esc_freq <= 1 {
+                        break;
+                    }
+                }
+                self.set_ns(ctx, 1);
+                self.sa.free_units(stats, (old_ns + 1) >> 1);
+                let os = Self::one_state(ctx);
+                self.found_state = os;
+                let os = os as usize;
+                if let Some(d) = self.sa.heap.get_mut(os..os + STATE_SIZE as usize) {
+                    d.copy_from_slice(&tmp);
+                }
+                return;
+            }
+        }
+        esc_freq -= esc_freq >> 1;
+        let summ = (summ & 0xffff) as i32 + esc_freq;
+        let n0 = (old_ns + 1) >> 1;
+        let n1 = (ns + 1) >> 1;
+        let mut new_stats = stats;
+        if n0 != n1 {
+            new_stats = self.sa.shrink_units(stats, n0, n1);
+        }
+        self.set_ctx_head(ctx, ns, summ as u32, new_stats);
+        self.found_state = new_stats;
+    }
+
+    #[cold]
+    fn rescale_slow(&mut self, ctx: u32) {
         let old_ns = self.ns(ctx);
         let mut i = old_ns as i32 - 1;
         let stats = self.stats(ctx);
@@ -738,12 +897,14 @@ impl ModelPPM {
     fn create_successors(&mut self, skip: bool, p1: u32) -> u32 {
         let mut pc = self.min_context;
         let up_branch = self.succ(self.found_state);
-        let mut ps: Vec<u32> = Vec::with_capacity(MAX_O);
+        let mut ps = [0u32; MAX_O];
+        let mut ps_len = 0;
         let mut p;
         let fs_sym = self.sym(self.found_state);
         let mut no_loop = false;
         if !skip {
-            ps.push(self.found_state);
+            ps[0] = self.found_state;
+            ps_len = 1;
             if self.suffix(pc) == 0 {
                 no_loop = true;
             }
@@ -763,53 +924,47 @@ impl ModelPPM {
                     if pc == 0 {
                         return 0;
                     }
-                    if self.ns(pc) != 1 {
-                        p = self.stats(pc);
-                        let mut guard = 0;
-                        while self.sym(p) != fs_sym {
-                            p += STATE_SIZE;
-                            guard += 1;
-                            if guard > 256 {
-                                return 0;
-                            }
-                        }
+                    let (ns, _, stats) = self.ctx_head(pc);
+                    if ns != 1 {
+                        p = match self.find_state(stats, ns, fs_sym) {
+                            Some(p) => p,
+                            None => return 0,
+                        };
                     } else {
                         p = Self::one_state(pc);
                     }
                 }
                 entry = false;
-                if self.succ(p) != up_branch {
-                    pc = self.succ(p);
+                let succ = self.succ(p);
+                if succ != up_branch {
+                    pc = succ;
                     break;
                 }
-                if ps.len() >= MAX_O {
+                if ps_len >= MAX_O {
                     return 0;
                 }
-                ps.push(p);
+                ps[ps_len] = p;
+                ps_len += 1;
                 if self.suffix(pc) == 0 {
                     break;
                 }
             }
         }
-        if ps.is_empty() {
+        if ps_len == 0 {
             return pc;
         }
         let mut up = State { symbol: self.sa.u8_(up_branch), freq: 0, successor: up_branch.wrapping_add(1) };
-        if self.ns(pc) != 1 {
+        let (ns, summ, stats) = self.ctx_head(pc);
+        if ns != 1 {
             if pc <= self.sa.p_text {
                 return 0;
             }
-            let mut p = self.stats(pc);
-            let mut guard = 0;
-            while self.sym(p) != up.symbol as u32 {
-                p += STATE_SIZE;
-                guard += 1;
-                if guard > 256 {
-                    return 0;
-                }
-            }
+            let p = match self.find_state(stats, ns, up.symbol as u32) {
+                Some(p) => p,
+                None => return 0,
+            };
             let cf = self.freq(p).wrapping_sub(1);
-            let s0 = self.summ_freq(pc).wrapping_sub(self.ns(pc)).wrapping_sub(cf);
+            let s0 = summ.wrapping_sub(ns).wrapping_sub(cf);
             up.freq = (1 + if 2 * cf <= s0 {
                 (5 * cf > s0) as u32
             } else {
@@ -818,8 +973,9 @@ impl ModelPPM {
         } else {
             up.freq = self.freq(Self::one_state(pc)) as u8;
         }
-        while let Some(s) = ps.pop() {
-            pc = self.create_child(pc, s, up);
+        while ps_len > 0 {
+            ps_len -= 1;
+            pc = self.create_child(pc, ps[ps_len], up);
             if pc == 0 {
                 return 0;
             }
@@ -830,29 +986,26 @@ impl ModelPPM {
     fn update_model(&mut self) {
         let fs = self.get_state(self.found_state);
         let mut p: u32 = 0;
-        let mut pc = self.suffix(self.min_context);
+        let pc = self.suffix(self.min_context);
         if (fs.freq as u32) < MAX_FREQ / 4 && pc != 0 {
-            if self.ns(pc) != 1 {
-                p = self.stats(pc);
+            let (ns, summ, stats) = self.ctx_head(pc);
+            if ns != 1 {
+                p = stats;
                 if self.sym(p) != fs.symbol as u32 {
-                    let mut guard = 0;
-                    loop {
-                        p += STATE_SIZE;
-                        guard += 1;
-                        if self.sym(p) == fs.symbol as u32 || guard > 256 {
-                            break;
-                        }
-                    }
+                    p = match self.find_state(stats, ns, fs.symbol as u32) {
+                        Some(p) => p,
+                        // Like the original loop, which stops after 257 states.
+                        None => stats + 257 * STATE_SIZE,
+                    };
                     if self.freq(p) >= self.freq(p - STATE_SIZE) {
                         self.swap_states(p, p - STATE_SIZE);
                         p -= STATE_SIZE;
                     }
                 }
-                if self.freq(p) < MAX_FREQ - 9 {
-                    let f = self.freq(p) + 2;
-                    self.set_freq(p, f);
-                    let s = self.summ_freq(pc) + 2;
-                    self.set_summ_freq(pc, s);
+                let f = self.freq(p);
+                if f < MAX_FREQ - 9 {
+                    self.set_freq(p, f + 2);
+                    self.set_summ_freq(pc, summ + 2);
                 }
             } else {
                 p = Self::one_state(pc);
@@ -900,56 +1053,49 @@ impl ModelPPM {
             self.set_succ(fsp, successor);
             fs_succ = self.min_context;
         }
-        let ns = self.ns(self.min_context);
-        let s0 = self.summ_freq(self.min_context).wrapping_sub(ns).wrapping_sub(fs.freq as u32 - 1);
-        pc = self.max_context;
+        let (ns, min_summ, _) = self.ctx_head(self.min_context);
+        let s0 = min_summ.wrapping_sub(ns).wrapping_sub(fs.freq as u32 - 1);
+        let mut pc = self.max_context;
         while pc != self.min_context {
-            let mut ns1 = self.ns(pc);
+            let (mut ns1, mut summ, mut stats) = self.ctx_head(pc);
             if ns1 != 1 {
                 if ns1 & 1 == 0 {
-                    let st = self.sa.expand_units(self.stats(pc), ns1 >> 1);
-                    self.set_stats(pc, st);
-                    if st == 0 {
+                    stats = self.sa.expand_units(stats, ns1 >> 1);
+                    if stats == 0 {
+                        self.set_stats(pc, 0);
                         self.restart();
                         return;
                     }
                 }
-                let sf = self.summ_freq(pc);
-                let add = (2 * ns1 < ns) as u32 + 2 * ((4 * ns1 <= ns) as u32 & (sf <= 8 * ns1) as u32);
-                self.set_summ_freq(pc, sf + add);
+                let add = (2 * ns1 < ns) as u32 + 2 * ((4 * ns1 <= ns) as u32 & (summ <= 8 * ns1) as u32);
+                summ = (summ + add) & 0xffff;
             } else {
                 let p = self.sa.alloc_units(1);
                 if p == 0 {
                     self.restart();
                     return;
                 }
-                let os = self.get_state(Self::one_state(pc));
-                self.put_state(p, os);
-                self.set_stats(pc, p);
+                // Move OneState to the new state array.
+                self.sa.copy(p, Self::one_state(pc), STATE_SIZE);
+                stats = p;
                 let f = self.freq(p);
-                if f < MAX_FREQ / 4 - 1 {
-                    self.set_freq(p, f + f);
-                } else {
-                    self.set_freq(p, MAX_FREQ - 4);
-                }
-                let sf = self.freq(p) as i32 + self.init_esc + (ns > 3) as i32;
-                self.set_summ_freq(pc, sf as u32);
+                let f = if f < MAX_FREQ / 4 - 1 { f + f } else { MAX_FREQ - 4 };
+                self.set_freq(p, f);
+                let f = f & 0xff;
+                summ = (f as i32 + self.init_esc + (ns > 3) as i32) as u32 & 0xffff;
             }
-            let mut cf = 2 * fs.freq as u32 * (self.summ_freq(pc) + 6);
-            let sf = s0.wrapping_add(self.summ_freq(pc));
+            let mut cf = 2 * fs.freq as u32 * (summ + 6);
+            let sf = s0.wrapping_add(summ);
             if cf < 6 * sf {
                 cf = 1 + (cf > sf) as u32 + (cf >= 4 * sf) as u32;
-                let s = self.summ_freq(pc) + 3;
-                self.set_summ_freq(pc, s);
+                summ += 3;
             } else {
                 cf = 4 + (cf >= 9 * sf) as u32 + (cf >= 12 * sf) as u32 + (cf >= 15 * sf) as u32;
-                let s = self.summ_freq(pc) + cf;
-                self.set_summ_freq(pc, s);
+                summ += cf;
             }
-            let p = self.stats(pc) + ns1 * STATE_SIZE;
-            self.put_state(p, State { symbol: fs.symbol, freq: cf as u8, successor });
+            self.put_state(stats + ns1 * STATE_SIZE, State { symbol: fs.symbol, freq: cf as u8, successor });
             ns1 += 1;
-            self.set_ns(pc, ns1);
+            self.set_ctx_head(pc, ns1, summ, stats);
             pc = self.suffix(pc);
             if pc == 0 {
                 break;
@@ -1007,14 +1153,35 @@ impl ModelPPM {
 
     fn update1(&mut self, ctx: u32, p: u32) {
         self.found_state = p;
-        let f = self.freq(p) + 4;
-        self.set_freq(p, f);
         let s = self.summ_freq(ctx) + 4;
         self.set_summ_freq(ctx, s);
-        if self.freq(p) > self.freq(p - STATE_SIZE) {
-            self.swap_states(p, p - STATE_SIZE);
+        // Previous and found states.
+        let a = p.wrapping_sub(STATE_SIZE) as usize;
+        let mut swapped = false;
+        let mut prev_freq = 0;
+        match self.sa.heap.get_mut(a..a + 2 * STATE_SIZE as usize) {
+            Some(w) => {
+                w[7] = w[7].wrapping_add(4);
+                if w[7] > w[1] {
+                    let (x, y) = w.split_at_mut(STATE_SIZE as usize);
+                    x.swap_with_slice(y);
+                    swapped = true;
+                    prev_freq = w[1] as u32;
+                }
+            }
+            None => {
+                let f = self.freq(p) + 4;
+                self.set_freq(p, f);
+                if self.freq(p) > self.freq(p - STATE_SIZE) {
+                    self.swap_states(p, p - STATE_SIZE);
+                    swapped = true;
+                    prev_freq = self.freq(p - STATE_SIZE);
+                }
+            }
+        }
+        if swapped {
             self.found_state = p - STATE_SIZE;
-            if self.freq(p - STATE_SIZE) > MAX_FREQ {
+            if prev_freq > MAX_FREQ {
                 self.rescale(ctx);
             }
         }
@@ -1148,68 +1315,71 @@ impl ModelPPM {
 
     fn decode_symbol2(&mut self, ctx: u32) -> bool {
         let ns = self.ns(ctx) as i32;
-        if self.num_masked > ns {
+        if self.num_masked > ns || ns > 256 {
             return false;
         }
-        let mut i = ns - self.num_masked;
-        let psee2c = self.make_esc_freq2(ctx, i);
-        let mut ps = [0u32; 256];
-        let mut ps_len = 0usize;
-        let stats = self.stats(ctx);
-        let end = stats + ns as u32 * STATE_SIZE;
-        let mut p = stats.wrapping_sub(STATE_SIZE);
-        let mut hi_cnt: i32 = 0;
-        loop {
-            loop {
-                p = p.wrapping_add(STATE_SIZE);
-                if p >= end {
-                    return false;
-                }
-                if self.char_mask[self.sym(p) as usize] != self.esc_count {
+        let want = (ns - self.num_masked).max(1) as usize;
+        let psee2c = self.make_esc_freq2(ctx, ns - self.num_masked);
+        let stats = self.stats(ctx) as usize;
+        // Positions of unmasked states in the state array.
+        let mut n = 0;
+        let mut hi_cnt: u32 = 0;
+        {
+            let st = match self.sa.heap.get(stats..stats + ns as usize * STATE_SIZE as usize) {
+                Some(st) => st,
+                None => return false,
+            };
+            let esc = self.esc_count;
+            let mask = &self.char_mask;
+            let ps = &mut self.ps;
+            // Branchless, because masked and unmasked states alternate
+            // unpredictably.
+            for (k, s) in st.as_chunks::<{ STATE_SIZE as usize }>().0.iter().enumerate() {
+                let unmasked = (mask[s[0] as usize] != esc) as usize;
+                ps[n & 0xff] = k as u8;
+                hi_cnt += s[1] as u32 & (unmasked as u32).wrapping_neg();
+                n += unmasked;
+                if n == want {
                     break;
                 }
             }
-            hi_cnt += self.freq(p) as i32;
-            if ps_len >= 256 {
-                return false;
-            }
-            ps[ps_len] = p;
-            ps_len += 1;
-            i -= 1;
-            if i <= 0 {
-                break;
-            }
         }
-        self.coder.scale = self.coder.scale.wrapping_add(hi_cnt as u32);
+        if n < want {
+            return false;
+        }
+        self.coder.scale = self.coder.scale.wrapping_add(hi_cnt);
         let count = self.current_count();
         if count >= self.coder.scale as i32 {
             return false;
         }
-        let mut k = 0;
-        p = ps[0];
-        if count < hi_cnt {
-            hi_cnt = 0;
+        if count < hi_cnt as i32 {
+            let st = &self.sa.heap[stats..stats + ns as usize * STATE_SIZE as usize];
+            let mut acc = 0u32;
+            let mut k = 0;
             loop {
-                hi_cnt += self.freq(p) as i32;
-                if hi_cnt > count {
+                let pos = self.ps[k] as usize * STATE_SIZE as usize;
+                let f = st[pos + 1] as u32;
+                acc += f;
+                if acc as i32 > count {
+                    self.coder.high_count = acc;
+                    self.coder.low_count = acc - f;
                     break;
                 }
                 k += 1;
-                if k >= ps_len {
+                if k >= n {
                     return false;
                 }
-                p = ps[k];
             }
-            self.coder.high_count = hi_cnt as u32;
-            self.coder.low_count = (hi_cnt - self.freq(p) as i32) as u32;
+            let p = stats as u32 + self.ps[k] as u32 * STATE_SIZE;
             self.see2[psee2c].update();
             self.update2(ctx, p);
         } else {
-            self.coder.low_count = hi_cnt as u32;
+            self.coder.low_count = hi_cnt;
             self.coder.high_count = self.coder.scale;
-            let n = (ns - self.num_masked) as usize;
-            for &q in ps[..ps_len].iter().take(n) {
-                self.char_mask[self.sym(q) as usize] = self.esc_count;
+            let st = &self.sa.heap[stats..stats + ns as usize * STATE_SIZE as usize];
+            let esc = self.esc_count;
+            for &k in &self.ps[..n] {
+                self.char_mask[st[k as usize * STATE_SIZE as usize] as usize] = esc;
             }
             let sc = self.coder.scale as u16;
             self.see2[psee2c].summ = self.see2[psee2c].summ.wrapping_add(sc);
@@ -1230,26 +1400,26 @@ impl ModelPPM {
         self.start_model_rare(2);
     }
 
-    fn init_decoder(&mut self, rd: Reader) {
+    fn init_decoder<R: ByteReader>(&mut self, rd: &mut R) {
         self.coder.low = 0;
         self.coder.code = 0;
         self.coder.range = 0xffffffff;
         for _ in 0..4 {
-            self.coder.code = (self.coder.code << 8) | rd() as u32;
+            self.coder.code = (self.coder.code << 8) | rd.byte() as u32;
         }
     }
 
-    pub fn decode_init(&mut self, esc_char: &mut i32, rd: Reader) -> bool {
-        let mut max_order = rd() as i32;
+    pub fn decode_init<R: ByteReader>(&mut self, esc_char: &mut i32, rd: &mut R) -> bool {
+        let mut max_order = rd.byte() as i32;
         let reset = max_order & 0x20 != 0;
         let mut max_mb = 0;
         if reset {
-            max_mb = rd() as u32;
+            max_mb = rd.byte() as u32;
         } else if self.sa.size == 0 {
             return false;
         }
         if max_order & 0x40 != 0 {
-            *esc_char = rd() as i32;
+            *esc_char = rd.byte() as i32;
         }
         self.init_decoder(rd);
         if reset {
@@ -1267,7 +1437,8 @@ impl ModelPPM {
         self.min_context != 0
     }
 
-    fn normalize(&mut self, rd: Reader) {
+    #[inline(always)]
+    fn normalize<R: ByteReader>(&mut self, rd: &mut R) {
         let mut guard = 0;
         loop {
             let c = &mut self.coder;
@@ -1278,7 +1449,7 @@ impl ModelPPM {
                     break;
                 }
             }
-            c.code = (c.code << 8) | rd() as u32;
+            c.code = (c.code << 8) | rd.byte() as u32;
             c.range <<= 8;
             c.low <<= 8;
             guard += 1;
@@ -1300,7 +1471,7 @@ impl ModelPPM {
     }
 
     /// Decode a character. Returns -1 on error.
-    pub fn decode_char(&mut self, rd: Reader) -> i32 {
+    pub fn decode_char<R: ByteReader>(&mut self, rd: &mut R) -> i32 {
         self.error = false;
         if !self.ctx_valid(self.min_context) {
             return -1;

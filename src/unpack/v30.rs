@@ -36,17 +36,66 @@ fn dtables() -> &'static DTables {
 }
 
 impl Unpack {
+    fn ppm_input<'a>(&'a mut self, io: &'a mut dyn UnpackIo) -> (&'a mut super::ppmd::ModelPPM, PpmInput<'a>) {
+        let rd = PpmInput {
+            inp: &mut self.inp,
+            read_top: &mut self.read_top,
+            read_border: &mut self.read_border,
+            block_header: &mut self.block_header,
+            io,
+        };
+        (&mut self.ppm, rd)
+    }
+
+    #[inline(always)]
     fn ppm_decode_char(&mut self, io: &mut dyn UnpackIo) -> i32 {
-        let mut ppm = self.ppm.take().unwrap();
-        let ch = ppm.decode_char(&mut || self.get_char(io));
-        self.ppm = Some(ppm);
-        ch
+        let (ppm, mut rd) = self.ppm_input(io);
+        ppm.decode_char(&mut rd)
+    }
+
+    /// Decode PPM literals to the window while checks in the beginning of
+    /// unpack29 loop would not do anything: the window is not wrapped, data
+    /// need not be written and input need not be read. Returns None after
+    /// storing literals, or the decoded value which needs other processing:
+    /// the escape character or -1 on error.
+    fn ppm_decode_literals(&mut self, io: &mut dyn UnpackIo) -> Option<i32> {
+        let max = self.max_win_size;
+        // Distance to written data. Equal pointers mean that all data are
+        // written, so the whole window is available.
+        let dist = if self.wr_ptr == self.unp_ptr { max } else { self.wr_ptr.wrapping_sub(self.unp_ptr) & self.max_win_mask };
+        let room = dist.saturating_sub(MAX3_INC_LZ_MATCH as usize).min(max - self.unp_ptr);
+        if room == 0 {
+            return Some(self.ppm_decode_char(io));
+        }
+        let esc = self.ppm_esc_char;
+        let mut rd = PpmInput {
+            inp: &mut self.inp,
+            read_top: &mut self.read_top,
+            read_border: &mut self.read_border,
+            block_header: &mut self.block_header,
+            io,
+        };
+        let mut ptr = self.unp_ptr;
+        let end = ptr + room;
+        loop {
+            let ch = self.ppm.decode_char(&mut rd);
+            if ch == -1 || ch == esc {
+                self.unp_ptr = ptr;
+                return Some(ch);
+            }
+            self.window[ptr] = ch as u8;
+            ptr += 1;
+            if ptr == end || rd.inp.in_addr as i64 > *rd.read_border {
+                self.unp_ptr = ptr;
+                return None;
+            }
+        }
     }
 
     fn safe_ppm_decode_char(&mut self, io: &mut dyn UnpackIo) -> i32 {
         let ch = self.ppm_decode_char(io);
         if ch == -1 {
-            self.ppm.as_mut().unwrap().clean_up();
+            self.ppm.clean_up();
             self.unp_block_ppm = false;
         }
         ch
@@ -82,9 +131,12 @@ impl Unpack {
                 }
             }
             if self.unp_block_ppm {
-                let ch = self.ppm_decode_char(io);
+                let ch = match self.ppm_decode_literals(io) {
+                    Some(ch) => ch,
+                    None => continue,
+                };
                 if ch == -1 {
-                    self.ppm.as_mut().unwrap().clean_up();
+                    self.ppm.clean_up();
                     self.unp_block_ppm = false;
                     break;
                 }
@@ -551,9 +603,8 @@ impl Unpack {
         if bit_field & 0x8000 != 0 {
             self.unp_block_ppm = true;
             let mut esc = self.ppm_esc_char;
-            let mut ppm = self.ppm.take().unwrap();
-            let r = ppm.decode_init(&mut esc, &mut || self.get_char(io));
-            self.ppm = Some(ppm);
+            let (ppm, mut rd) = self.ppm_input(io);
+            let r = ppm.decode_init(&mut esc, &mut rd);
             self.ppm_esc_char = esc;
             return r;
         }
