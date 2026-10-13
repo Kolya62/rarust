@@ -157,12 +157,10 @@ impl SubAllocator {
         self.stop();
         let alloc_size = t / FIXED_UNIT_SIZE * UNIT_SIZE + 2 * UNIT_SIZE;
         let total = (HEAP_BASE + alloc_size) as usize;
-        let mut h: Vec<u8> = Vec::new();
-        if h.try_reserve_exact(total).is_err() {
-            crate::errhnd::memory_error();
+        match super::alloc_zeroed(total) {
+            Ok(h) => self.heap = h,
+            Err(_) => crate::errhnd::memory_error(),
         }
-        h.resize(total, 0);
-        self.heap = h;
         self.heap_start = HEAP_BASE;
         self.heap_end = self.heap_start + alloc_size - UNIT_SIZE;
         self.size = t;

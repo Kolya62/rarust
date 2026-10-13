@@ -145,6 +145,19 @@ pub struct AudioVariables {
 #[derive(Debug)]
 pub struct AllocError;
 
+/// Allocate a zero filled buffer. Unlike resizing a reserved vector, the
+/// memory is not written here, so the system maps pages only when they are
+/// used. A small file with a huge dictionary does not cost the whole
+/// dictionary in time and memory.
+pub(crate) fn alloc_zeroed(size: usize) -> Result<Vec<u8>, AllocError> {
+    // vec! aborts the process if the allocation fails, so check if the
+    // memory can be allocated first.
+    let mut probe: Vec<u8> = Vec::new();
+    probe.try_reserve_exact(size).map_err(|_| AllocError)?;
+    drop(probe);
+    Ok(vec![0u8; size])
+}
+
 pub struct Unpack {
     inp: BitInput,
     filter_src_memory: Vec<u8>,
@@ -339,12 +352,7 @@ impl Unpack {
             return Err(AllocError);
         }
         self.window = Vec::new();
-        let mut w: Vec<u8> = Vec::new();
-        if w.try_reserve_exact(win_size as usize).is_err() {
-            return Err(AllocError);
-        }
-        w.resize(win_size as usize, 0);
-        self.window = w;
+        self.window = alloc_zeroed(win_size as usize)?;
         self.alloc_win_size = win_size;
         Ok(())
     }
