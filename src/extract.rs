@@ -73,7 +73,11 @@ pub struct CmdExtract {
 
 /// Copy stored (not compressed) data.
 pub fn unstore_file(io: &mut dyn UnpackIo, dest_unp_size: i64) {
-    let mut buf = vec![0u8; 0x400000];
+    // Allocate and clear only the memory needed for small files. Size is
+    // a multiple of encryption block size, because reading of encrypted
+    // data is aligned to it.
+    let size = (dest_unp_size.clamp(0x10000, 0x400000) as usize + 15) & !15;
+    let mut buf = vec![0u8; size];
     let mut left = dest_unp_size;
     loop {
         let r = io.unp_read(&mut buf);
