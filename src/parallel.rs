@@ -11,7 +11,8 @@
 //! by the main thread in archive order, so the output and exit code are
 //! the same as with sequential extraction. Directories are processed by
 //! the main thread after all preceding files, so their times are not
-//! changed by files extracted later.
+//! changed by files extracted later. Small files are also extracted by the
+//! main thread, because file system operations dominate for them.
 
 use crate::archive::Archive;
 use crate::cmddata::{CommandData, OverwriteMode};
@@ -26,11 +27,17 @@ use std::sync::mpsc;
 /// Memory budget for dictionaries of all workers together.
 const WINDOW_MEMORY_BUDGET: u64 = 2 << 30;
 
+/// Files smaller than this are extracted by the main thread. Creating many
+/// small files in parallel is slower, because file system operations
+/// dominate and do not scale.
+const MIN_PARALLEL_FILE_SIZE: i64 = 32 * 1024;
+
 /// Header positions belonging to one archived file: the file header and
 /// following service headers, such as NTFS streams or security data.
 pub struct Group {
     pub headers: Vec<i64>,
-    /// Processed by the main thread: directories and leading headers.
+    /// Processed by the main thread: directories, small files and leading
+    /// headers.
     pub main_thread: bool,
 }
 
@@ -192,7 +199,10 @@ fn scan(cmd: &CommandData, arc: &mut Archive, command: char) -> Option<Plan> {
             if !h.dir {
                 max_window = max_window.max(h.win_size);
             }
-            groups.push(Group { headers: vec![pos], main_thread: h.dir });
+            // Key derivation for encrypted files takes long regardless of
+            // the file size.
+            let small = h.unp_size < MIN_PARALLEL_FILE_SIZE && !h.encrypted;
+            groups.push(Group { headers: vec![pos], main_thread: h.dir || small });
         } else {
             match groups.last_mut() {
                 Some(g) => g.headers.push(pos),

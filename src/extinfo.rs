@@ -33,8 +33,14 @@ pub fn get_umask() -> u32 {
     })
 }
 
-/// Effective user ID without libc: owner of /proc/self.
+/// Effective user ID without libc: owner of /proc/self. It is checked for
+/// every extracted file, so the value is cached.
 pub fn geteuid() -> u32 {
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UID.get_or_init(geteuid_uncached)
+}
+
+fn geteuid_uncached() -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

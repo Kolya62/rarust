@@ -174,13 +174,13 @@ fn dot_dot_dir_entry() {
 fn same_destination_in_order() {
     let d = tmp_dir("samedest");
     let mut entries = Vec::new();
-    // Enough files to enable parallel extraction.
+    // Enough files large enough to enable parallel extraction.
     const NAMES: [&str; 8] = ["f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7"];
     for n in NAMES {
-        entries.push(file(n, n.as_bytes()));
+        entries.push(file(n, &n.as_bytes().repeat(40000)));
     }
     let big_first = vec![b'1'; 300000];
-    let small_last = b"2".to_vec();
+    let small_last = vec![b'2'; 40000];
     entries.push(Entry { name: "x/../same", ..file("", &big_first) });
     entries.push(Entry { name: "./same", ..file("", &small_last) });
     let a = write_arc(&d, &entries);

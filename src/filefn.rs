@@ -164,7 +164,9 @@ pub fn is_removable(_name: &str) -> bool {
 }
 
 pub fn file_exist(name: &str) -> bool {
-    std::fs::symlink_metadata(to_path(name)).is_ok() || std::fs::metadata(to_path(name)).is_ok()
+    // A name which is not found without following links is not found
+    // with following them either, and a dangling link exists.
+    std::fs::symlink_metadata(to_path(name)).is_ok()
 }
 
 pub fn wild_file_exist(name: &str) -> bool {

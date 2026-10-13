@@ -143,7 +143,7 @@ fn ppmd_text(n: usize) -> Vec<u8> {
         for _ in 0..1 + xorshift(&mut x) % 3 {
             out.extend_from_slice(SYL[(xorshift(&mut x) % 32) as usize].as_bytes());
         }
-        out.push(if xorshift(&mut x) % 16 == 0 { b'\n' } else { b' ' });
+        out.push(if xorshift(&mut x).is_multiple_of(16) { b'\n' } else { b' ' });
     }
     out.truncate(n);
     out
