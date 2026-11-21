@@ -5,7 +5,7 @@
 **Fast, dependency-free RAR extractor written in Rust**
 
 [![Rust](https://img.shields.io/badge/Rust-orange?logo=rust)](https://www.rust-lang.org)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3+-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-lightgrey)](#building)
 
 **English** · [Русский](README.ru.md)
@@ -237,4 +237,4 @@ cargo test --release
 
 ## License
 
-Distributed under the [Mozilla Public License 2.0](LICENSE).
+Distributed under the [GNU General Public License v3.0 or later](LICENSE).

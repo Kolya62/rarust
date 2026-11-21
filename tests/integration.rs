@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Integration tests: run the rarust command on fixture archives.
 //! Fixtures g4_* and g5_* were created by RAR 6.24 and 7.23 from the

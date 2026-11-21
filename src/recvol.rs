@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Recovery volumes: RAR 3.x (.rev with 8-bit Reed-Solomon) and
 //! RAR 5.0 (.rev with 16-bit Reed-Solomon).

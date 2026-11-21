@@ -5,7 +5,7 @@
 **Быстрый распаковщик RAR на Rust без зависимостей**
 
 [![Rust](https://img.shields.io/badge/Rust-orange?logo=rust)](https://www.rust-lang.org)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3+-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-lightgrey)](#сборка)
 
 [English](README.md) · **Русский**
@@ -243,4 +243,4 @@ cargo test --release
 
 ## Лицензия
 
-Распространяется по лицензии [Mozilla Public License 2.0](LICENSE).
+Распространяется по лицензии [GNU General Public License v3.0 или более поздней версии](LICENSE).

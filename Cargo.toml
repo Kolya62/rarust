@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast, dependency-free RAR extractor written in Rust"
 rust-version = "1.88"
-license = "MPL-2.0"
+license = "GPL-3.0-or-later"
 
 [lib]
 name = "rarust"

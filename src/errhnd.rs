@@ -1,6 +1,4 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Error handling and exit codes. Fatal errors unwind the stack with a
 //! `RarExit` payload, which is caught at the top level.
