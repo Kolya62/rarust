@@ -217,7 +217,7 @@ src/
 ├── unpack/              Распаковщики: rar15, rar2, rar3 (+ PPMd), rar5
 ├── crypt/               Шифры RAR 1.3–3.x, AES
 ├── hash/                CRC32, BLAKE2sp, SHA-1, SHA-256, HMAC, PBKDF2
-├── recvol.rs            Тома восстановления (Рид-Соломон, 8 и 16 бит)
+├── recvol/              Тома восстановления (Рид-Соломон, 8 и 16 бит)
 ├── volume.rs            Многотомные архивы
 ├── extinfo.rs, motw.rs  Ссылки, владельцы, ACL, потоки, Mark of the Web
 ├── tz.rs, timefn.rs     Часовые пояса (TZif, правила POSIX TZ) и форматы времени
