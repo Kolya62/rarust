@@ -207,6 +207,7 @@ src/
 ├── main.rs, lib.rs      Command line entry point
 ├── cmddata.rs           Command line and switch parsing
 ├── archive.rs           Archive headers (RAR 1.4, 1.5–4.x, 5.0)
+├── rar5hdr.rs           RAR 5.0 header parser
 ├── extract.rs, list.rs  Extract, test and list commands
 ├── unpack/              Decompressors: v15, v20, v30 (+ RarVM, PPMd), rar5
 ├── crypt/               RAR 1.3–3.x ciphers, AES
