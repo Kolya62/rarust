@@ -1,49 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! AES (Rijndael) with CBC mode, as used by RAR 3.x and 5.0.
+//! AES (FIPS 197) in CBC mode, as used by RAR 3.x (AES-128) and RAR 5.0
+//! (AES-256). Table based: each round is four lookups per output column.
 
-const SBOX: [u8; 256] = {
-    // Generate S-box at compile time.
-    let mut sbox = [0u8; 256];
-    let mut p: u8 = 1;
-    let mut q: u8 = 1;
-    loop {
-        // p * 3
-        p = p ^ (p << 1) ^ (if p & 0x80 != 0 { 0x1b } else { 0 });
-        // q / 3
-        q ^= q << 1;
-        q ^= q << 2;
-        q ^= q << 4;
-        if q & 0x80 != 0 {
-            q ^= 0x09;
-        }
-        let x = q ^ q.rotate_left(1) ^ q.rotate_left(2) ^ q.rotate_left(3) ^ q.rotate_left(4);
-        sbox[p as usize] = x ^ 0x63;
-        if p == 1 {
-            break;
-        }
-    }
-    sbox[0] = 0x63;
-    sbox
-};
-
-const INV_SBOX: [u8; 256] = {
-    let mut inv = [0u8; 256];
-    let mut i = 0;
-    while i < 256 {
-        inv[SBOX[i] as usize] = i as u8;
-        i += 1;
-    }
-    inv
-};
-
+/// Multiplication by x in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1.
 const fn xtime(a: u8) -> u8 {
-    (a << 1) ^ (if a & 0x80 != 0 { 0x1b } else { 0 })
+    (a << 1) ^ if a & 0x80 != 0 { 0x1b } else { 0 }
 }
 
-const fn gmul(mut a: u8, mut b: u8) -> u8 {
+const fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut r = 0;
-    while b > 0 {
+    while b != 0 {
         if b & 1 != 0 {
             r ^= a;
         }
@@ -53,245 +20,245 @@ const fn gmul(mut a: u8, mut b: u8) -> u8 {
     r
 }
 
-// Encryption and decryption T-tables (column major, little endian words).
-const fn make_te() -> [u32; 256] {
+/// S-box: multiplicative inverse followed by the affine transform.
+const SBOX: [u8; 256] = {
+    let mut s = [0u8; 256];
+    let mut x = 0;
+    while x < 256 {
+        // Inverse as x^254.
+        let mut inv = 1u8;
+        let mut i = 0;
+        while i < 254 {
+            inv = gf_mul(inv, x as u8);
+            i += 1;
+        }
+        if x == 0 {
+            inv = 0;
+        }
+        s[x] = inv ^ inv.rotate_left(1) ^ inv.rotate_left(2) ^ inv.rotate_left(3) ^ inv.rotate_left(4) ^ 0x63;
+        x += 1;
+    }
+    s
+};
+
+const INV_SBOX: [u8; 256] = {
+    let mut s = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        s[SBOX[i] as usize] = i as u8;
+        i += 1;
+    }
+    s
+};
+
+const fn column(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    u32::from_be_bytes([a, b, c, d])
+}
+
+/// Encryption table: SubBytes and MixColumns for the byte in row 0.
+/// Rows 1..3 use the same table rotated right by 8, 16 and 24 bits.
+const TE: [u32; 256] = {
     let mut t = [0u32; 256];
     let mut i = 0;
     while i < 256 {
         let s = SBOX[i];
-        t[i] = (gmul(s, 2) as u32) | ((s as u32) << 8) | ((s as u32) << 16) | ((gmul(s, 3) as u32) << 24);
+        t[i] = column(gf_mul(s, 2), s, s, gf_mul(s, 3));
         i += 1;
     }
     t
-}
-const fn make_td() -> [u32; 256] {
+};
+
+/// Decryption table: InvSubBytes and InvMixColumns for the byte in row 0.
+const TD: [u32; 256] = {
     let mut t = [0u32; 256];
     let mut i = 0;
     while i < 256 {
         let s = INV_SBOX[i];
-        t[i] = (gmul(s, 14) as u32)
-            | ((gmul(s, 9) as u32) << 8)
-            | ((gmul(s, 13) as u32) << 16)
-            | ((gmul(s, 11) as u32) << 24);
+        t[i] = column(gf_mul(s, 14), gf_mul(s, 9), gf_mul(s, 13), gf_mul(s, 11));
         i += 1;
     }
     t
+};
+
+fn sub_word(w: u32) -> u32 {
+    let b = w.to_be_bytes();
+    column(SBOX[b[0] as usize], SBOX[b[1] as usize], SBOX[b[2] as usize], SBOX[b[3] as usize])
 }
-static TE: [u32; 256] = make_te();
-static TD: [u32; 256] = make_td();
+
+/// InvMixColumns of one column, used to build the equivalent inverse
+/// cipher key schedule.
+fn inv_mix(w: u32) -> u32 {
+    let b = w.to_be_bytes();
+    let s = |i: usize| b[i % 4];
+    let mut r = [0u8; 4];
+    for (i, x) in r.iter_mut().enumerate() {
+        *x = gf_mul(s(i), 14) ^ gf_mul(s(i + 1), 11) ^ gf_mul(s(i + 2), 13) ^ gf_mul(s(i + 3), 9);
+    }
+    u32::from_be_bytes(r)
+}
+
+fn byte(w: u32, n: u32) -> usize {
+    ((w >> (24 - 8 * n)) & 0xff) as usize
+}
 
 #[derive(Clone)]
 pub struct Aes {
     rounds: usize,
-    enc_key: [u32; 60],
-    dec_key: [u32; 60],
+    /// Round keys for encryption, 4 words per round.
+    ek: [u32; 60],
+    /// Round keys for the equivalent inverse cipher, in decryption order.
+    dk: [u32; 60],
     iv: [u8; 16],
 }
 
-fn inv_mix_column(w: u32) -> u32 {
-    let b = w.to_le_bytes();
-    let mut r = [0u8; 4];
-    for i in 0..4 {
-        r[i] = gmul(b[i], 14) ^ gmul(b[(i + 1) % 4], 11) ^ gmul(b[(i + 2) % 4], 13) ^ gmul(b[(i + 3) % 4], 9);
-    }
-    u32::from_le_bytes(r)
-}
-
-fn sub_word(w: u32) -> u32 {
-    let b = w.to_le_bytes();
-    u32::from_le_bytes([SBOX[b[0] as usize], SBOX[b[1] as usize], SBOX[b[2] as usize], SBOX[b[3] as usize]])
-}
-
 impl Aes {
-    /// `key` length must be 16, 24 or 32 bytes.
+    /// `key` must be 16, 24 or 32 bytes long.
     pub fn new(key: &[u8], iv: Option<&[u8; 16]>) -> Self {
+        assert!(matches!(key.len(), 16 | 24 | 32), "bad AES key length");
         let nk = key.len() / 4;
         let rounds = nk + 6;
-        let total = 4 * (rounds + 1);
-        let mut w = [0u32; 60];
-        for i in 0..nk {
-            w[i] = u32::from_le_bytes(key[i * 4..i * 4 + 4].try_into().unwrap());
+        let words = 4 * (rounds + 1);
+        let mut ek = [0u32; 60];
+        for (i, c) in key.chunks_exact(4).enumerate() {
+            ek[i] = u32::from_be_bytes(c.try_into().unwrap());
         }
-        let mut rcon: u8 = 1;
-        for i in nk..total {
-            let mut t = w[i - 1];
+        let mut rcon = 1u8;
+        for i in nk..words {
+            let mut t = ek[i - 1];
             if i % nk == 0 {
-                t = sub_word(t.rotate_right(8)) ^ rcon as u32;
+                t = sub_word(t.rotate_left(8)) ^ (rcon as u32) << 24;
                 rcon = xtime(rcon);
             } else if nk > 6 && i % nk == 4 {
                 t = sub_word(t);
             }
-            w[i] = w[i - nk] ^ t;
+            ek[i] = ek[i - nk] ^ t;
         }
-        // Equivalent inverse cipher key schedule.
-        let mut d = [0u32; 60];
+        let mut dk = [0u32; 60];
         for r in 0..=rounds {
             for c in 0..4 {
-                let v = w[(rounds - r) * 4 + c];
-                d[r * 4 + c] = if r == 0 || r == rounds { v } else { inv_mix_column(v) };
+                let w = ek[(rounds - r) * 4 + c];
+                dk[r * 4 + c] = if r == 0 || r == rounds { w } else { inv_mix(w) };
             }
         }
-        Aes { rounds, enc_key: w, dec_key: d, iv: iv.copied().unwrap_or([0; 16]) }
+        Aes { rounds, ek, dk, iv: iv.copied().unwrap_or([0; 16]) }
     }
 
-    fn encrypt_block(&self, b: &mut [u8; 16]) {
-        let k = &self.enc_key;
+    fn load(block: &[u8], k: &[u32]) -> [u32; 4] {
         let mut s = [0u32; 4];
         for c in 0..4 {
-            s[c] = u32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().unwrap()) ^ k[c];
+            s[c] = u32::from_be_bytes(block[c * 4..c * 4 + 4].try_into().unwrap()) ^ k[c];
         }
-        for r in 1..self.rounds {
-            let mut t = [0u32; 4];
-            for c in 0..4 {
-                t[c] = TE[(s[c] & 0xff) as usize]
-                    ^ TE[((s[(c + 1) % 4] >> 8) & 0xff) as usize].rotate_left(8)
-                    ^ TE[((s[(c + 2) % 4] >> 16) & 0xff) as usize].rotate_left(16)
-                    ^ TE[(s[(c + 3) % 4] >> 24) as usize].rotate_left(24)
-                    ^ k[r * 4 + c];
-            }
-            s = t;
-        }
+        s
+    }
+
+    fn store(s: [u32; 4], out: &mut [u8]) {
         for c in 0..4 {
-            let v = (SBOX[(s[c] & 0xff) as usize] as u32)
-                | ((SBOX[((s[(c + 1) % 4] >> 8) & 0xff) as usize] as u32) << 8)
-                | ((SBOX[((s[(c + 2) % 4] >> 16) & 0xff) as usize] as u32) << 16)
-                | ((SBOX[(s[(c + 3) % 4] >> 24) as usize] as u32) << 24);
-            b[c * 4..c * 4 + 4].copy_from_slice(&(v ^ k[self.rounds * 4 + c]).to_le_bytes());
+            out[c * 4..c * 4 + 4].copy_from_slice(&s[c].to_be_bytes());
         }
     }
 
-    fn decrypt_block(&self, b: &mut [u8; 16]) {
-        let k = &self.dec_key;
-        let mut s = [0u32; 4];
-        for c in 0..4 {
-            s[c] = u32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().unwrap()) ^ k[c];
-        }
+    fn encrypt_block(&self, block: &mut [u8]) {
+        let k = &self.ek;
+        let mut s = Self::load(block, k);
         for r in 1..self.rounds {
-            let mut t = [0u32; 4];
+            let mut n = [0u32; 4];
             for c in 0..4 {
-                t[c] = TD[(s[c] & 0xff) as usize]
-                    ^ TD[((s[(c + 3) % 4] >> 8) & 0xff) as usize].rotate_left(8)
-                    ^ TD[((s[(c + 2) % 4] >> 16) & 0xff) as usize].rotate_left(16)
-                    ^ TD[(s[(c + 1) % 4] >> 24) as usize].rotate_left(24)
+                n[c] = TE[byte(s[c], 0)]
+                    ^ TE[byte(s[(c + 1) & 3], 1)].rotate_right(8)
+                    ^ TE[byte(s[(c + 2) & 3], 2)].rotate_right(16)
+                    ^ TE[byte(s[(c + 3) & 3], 3)].rotate_right(24)
                     ^ k[r * 4 + c];
             }
-            s = t;
+            s = n;
         }
+        let mut n = [0u32; 4];
         for c in 0..4 {
-            let v = (INV_SBOX[(s[c] & 0xff) as usize] as u32)
-                | ((INV_SBOX[((s[(c + 3) % 4] >> 8) & 0xff) as usize] as u32) << 8)
-                | ((INV_SBOX[((s[(c + 2) % 4] >> 16) & 0xff) as usize] as u32) << 16)
-                | ((INV_SBOX[(s[(c + 1) % 4] >> 24) as usize] as u32) << 24);
-            b[c * 4..c * 4 + 4].copy_from_slice(&(v ^ k[self.rounds * 4 + c]).to_le_bytes());
+            n[c] = column(
+                SBOX[byte(s[c], 0)],
+                SBOX[byte(s[(c + 1) & 3], 1)],
+                SBOX[byte(s[(c + 2) & 3], 2)],
+                SBOX[byte(s[(c + 3) & 3], 3)],
+            ) ^ k[self.rounds * 4 + c];
         }
+        Self::store(n, block);
     }
 
-    /// CBC encrypt whole 16 byte blocks in place.
+    fn decrypt_block(&self, block: &mut [u8]) {
+        let k = &self.dk;
+        let mut s = Self::load(block, k);
+        for r in 1..self.rounds {
+            let mut n = [0u32; 4];
+            for c in 0..4 {
+                n[c] = TD[byte(s[c], 0)]
+                    ^ TD[byte(s[(c + 3) & 3], 1)].rotate_right(8)
+                    ^ TD[byte(s[(c + 2) & 3], 2)].rotate_right(16)
+                    ^ TD[byte(s[(c + 1) & 3], 3)].rotate_right(24)
+                    ^ k[r * 4 + c];
+            }
+            s = n;
+        }
+        let mut n = [0u32; 4];
+        for c in 0..4 {
+            n[c] = column(
+                INV_SBOX[byte(s[c], 0)],
+                INV_SBOX[byte(s[(c + 3) & 3], 1)],
+                INV_SBOX[byte(s[(c + 2) & 3], 2)],
+                INV_SBOX[byte(s[(c + 1) & 3], 3)],
+            ) ^ k[self.rounds * 4 + c];
+        }
+        Self::store(n, block);
+    }
+
+    /// CBC encryption of whole 16-byte blocks in place; a trailing partial
+    /// block is left untouched.
     pub fn cbc_encrypt(&mut self, data: &mut [u8]) {
-        for chunk in data.as_chunks_mut::<16>().0 {
-            let mut b = [0u8; 16];
-            for i in 0..16 {
-                b[i] = chunk[i] ^ self.iv[i];
+        for b in data.chunks_exact_mut(16) {
+            for (x, v) in b.iter_mut().zip(self.iv) {
+                *x ^= v;
             }
-            self.encrypt_block(&mut b);
-            chunk.copy_from_slice(&b);
-            self.iv = b;
+            self.encrypt_block(b);
+            self.iv.copy_from_slice(b);
         }
     }
 
-    /// Decrypt 4 independent blocks. Interleaving them lets the processor
-    /// execute table lookups of different blocks in parallel.
-    fn decrypt_block4(&self, b: &mut [[u8; 16]; 4]) {
-        let k = &self.dec_key;
-        let mut s = [[0u32; 4]; 4];
-        for j in 0..4 {
-            for c in 0..4 {
-                s[j][c] = u32::from_le_bytes(b[j][c * 4..c * 4 + 4].try_into().unwrap()) ^ k[c];
+    fn cbc_decrypt_serial(&self, data: &mut [u8], mut prev: [u8; 16]) {
+        for b in data.chunks_exact_mut(16) {
+            let ct: [u8; 16] = (&*b).try_into().unwrap();
+            self.decrypt_block(b);
+            for (x, v) in b.iter_mut().zip(prev) {
+                *x ^= v;
             }
-        }
-        for r in 1..self.rounds {
-            let mut t = [[0u32; 4]; 4];
-            for j in 0..4 {
-                for c in 0..4 {
-                    t[j][c] = TD[(s[j][c] & 0xff) as usize]
-                        ^ TD[((s[j][(c + 3) % 4] >> 8) & 0xff) as usize].rotate_left(8)
-                        ^ TD[((s[j][(c + 2) % 4] >> 16) & 0xff) as usize].rotate_left(16)
-                        ^ TD[(s[j][(c + 1) % 4] >> 24) as usize].rotate_left(24)
-                        ^ k[r * 4 + c];
-                }
-            }
-            s = t;
-        }
-        for j in 0..4 {
-            for c in 0..4 {
-                let v = (INV_SBOX[(s[j][c] & 0xff) as usize] as u32)
-                    | ((INV_SBOX[((s[j][(c + 3) % 4] >> 8) & 0xff) as usize] as u32) << 8)
-                    | ((INV_SBOX[((s[j][(c + 2) % 4] >> 16) & 0xff) as usize] as u32) << 16)
-                    | ((INV_SBOX[(s[j][(c + 1) % 4] >> 24) as usize] as u32) << 24);
-                b[j][c * 4..c * 4 + 4].copy_from_slice(&(v ^ k[self.rounds * 4 + c]).to_le_bytes());
-            }
+            prev = ct;
         }
     }
 
-    /// CBC decrypt whole 16 byte blocks with the given initialization vector.
-    fn cbc_decrypt_with(&self, data: &mut [u8], mut iv: [u8; 16]) -> [u8; 16] {
-        let (quads, rest) = data.as_chunks_mut::<64>();
-        for q in quads {
-            let ct: [u8; 64] = *q;
-            let mut b = [[0u8; 16]; 4];
-            for j in 0..4 {
-                b[j].copy_from_slice(&ct[j * 16..j * 16 + 16]);
-            }
-            self.decrypt_block4(&mut b);
-            for j in 0..4 {
-                let prev = if j == 0 { iv } else { ct[j * 16 - 16..j * 16].try_into().unwrap() };
-                for i in 0..16 {
-                    q[j * 16 + i] = b[j][i] ^ prev[i];
-                }
-            }
-            iv = ct[48..64].try_into().unwrap();
-        }
-        for chunk in rest.as_chunks_mut::<16>().0 {
-            let ct: [u8; 16] = *chunk;
-            let mut b = ct;
-            self.decrypt_block(&mut b);
-            for i in 0..16 {
-                chunk[i] = b[i] ^ iv[i];
-            }
-            iv = ct;
-        }
-        iv
-    }
-
-    /// CBC decrypt whole 16 byte blocks in place. Every block depends only
-    /// on the previous ciphertext block, so large buffers are split between
-    /// processor cores.
+    /// CBC decryption of whole 16-byte blocks in place. A plaintext block
+    /// needs only its own and the previous ciphertext block, so big buffers
+    /// are decrypted by several threads.
     pub fn cbc_decrypt(&mut self, data: &mut [u8]) {
-        const MIN_PART: usize = 256 * 1024;
         let len = data.len() & !15;
-        let data = &mut data[..len];
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
-        if threads < 2 || len < 2 * MIN_PART {
-            self.iv = self.cbc_decrypt_with(data, self.iv);
+        if len == 0 {
             return;
         }
-        let parts = threads.min(len / MIN_PART);
-        let part_len = (len / parts + 15) & !15;
-        // Initialization vectors of parts are the last ciphertext blocks of
-        // previous parts, take them before decrypting.
-        let mut ivs = vec![self.iv];
-        for p in 1..parts {
-            let pos = p * part_len;
-            ivs.push(data[pos - 16..pos].try_into().unwrap());
+        let data = &mut data[..len];
+        let next_iv: [u8; 16] = data[len - 16..].try_into().unwrap();
+        const PART: usize = 256 * 1024;
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+        let parts = threads.min(len / PART);
+        if parts < 2 {
+            self.cbc_decrypt_serial(data, self.iv);
+        } else {
+            let part_len = (len / parts + 15) & !15;
+            let mut ivs = vec![self.iv];
+            ivs.extend((part_len..len).step_by(part_len).map(|p| <[u8; 16]>::try_from(&data[p - 16..p]).unwrap()));
+            let this = &*self;
+            std::thread::scope(|sc| {
+                for (chunk, iv) in data.chunks_mut(part_len).zip(ivs) {
+                    sc.spawn(move || this.cbc_decrypt_serial(chunk, iv));
+                }
+            });
         }
-        let last_iv: [u8; 16] = data[len - 16..].try_into().unwrap();
-        let this = &*self;
-        std::thread::scope(|s| {
-            for (chunk, iv) in data.chunks_mut(part_len).zip(ivs) {
-                s.spawn(move || this.cbc_decrypt_with(chunk, iv));
-            }
-        });
-        self.iv = last_iv;
+        self.iv = next_iv;
     }
 }
 
@@ -316,9 +283,12 @@ mod tests {
     }
     #[test]
     fn sbox() {
-        assert_eq!(SBOX[0], 99);
-        assert_eq!(SBOX[1], 124);
-        assert_eq!(SBOX[255], 22);
+        assert_eq!(SBOX[0], 0x63);
+        assert_eq!(SBOX[1], 0x7c);
+        assert_eq!(SBOX[255], 0x16);
+        for i in 0..256 {
+            assert_eq!(INV_SBOX[SBOX[i] as usize] as usize, i);
+        }
     }
     #[test]
     fn cbc_large_matches_blockwise() {
