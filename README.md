@@ -47,7 +47,7 @@ All OK
 | **Archive formats** | RAR 1.4, RAR 1.5–4.x, RAR 5.0 / 7.0, self-extracting (SFX) archives |
 | **Compression** | RAR 1.5, 2.x (incl. audio), 3.x (LZ, PPMd, VM filters), 5.0/7.0 (E8, E8E9, ARM, Delta filters) |
 | **Dictionaries** | Up to 1 TB (RAR 7) |
-| **Multithreading** | Parallel extraction of non-solid archives of any version, multithreaded RAR 5 decoding, AES and BLAKE2sp |
+| **Multithreading** | Parallel extraction of non-solid archives of any version, multithreaded AES and BLAKE2sp |
 | **Encryption** | RAR 1.3, 1.5, 2.0, AES-128 (RAR 3.x), AES-256 (RAR 5.0), encrypted headers, password check values |
 | **Integrity** | CRC32, BLAKE2sp, checksum MACs for encrypted files |
 | **Volumes** | Multivolume archives with new (`.partN.rar`) and old (`.rNN`) naming |
@@ -208,7 +208,7 @@ src/
 ├── cmddata.rs           Command line and switch parsing
 ├── archive.rs           Archive headers (RAR 1.4, 1.5–4.x, 5.0)
 ├── extract.rs, list.rs  Extract, test and list commands
-├── unpack/              Decompressors: v15, v20, v30 (+ RarVM, PPMd), v50, v50mt
+├── unpack/              Decompressors: v15, v20, v30 (+ RarVM, PPMd), rar5
 ├── crypt/               RAR 1.3–3.x ciphers, AES
 ├── hash/                CRC32, BLAKE2sp, SHA-1, SHA-256, HMAC, PBKDF2
 ├── recvol.rs            Recovery volumes (Reed-Solomon 8 and 16 bit)

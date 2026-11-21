@@ -7,8 +7,7 @@ mod rarvm;
 mod v15;
 mod v20;
 mod v30;
-mod v50;
-mod v50mt;
+mod rar5;
 
 use crate::getbits::{BitInput, MAX_SIZE};
 use rarvm::{RarVM, VmPreparedProgram};
@@ -22,10 +21,8 @@ pub trait UnpackIo {
 }
 
 pub const MAX_QUICK_DECODE_BITS: u32 = 9;
-pub const MAX_UNPACK_FILTERS: usize = 8192;
 pub const MAX3_UNPACK_FILTERS: usize = 8192;
 pub const MAX3_UNPACK_CHANNELS: u32 = 1024;
-pub const MAX_FILTER_BLOCK_SIZE: u32 = 0x400000;
 pub const UNPACK_MAX_WRITE: usize = 0x400000;
 const UNPACK_MAX_DICT: u64 = 0x1000000000;
 
@@ -35,12 +32,6 @@ pub const MAX3_LZ_MATCH: u32 = 0x101;
 pub const MAX3_INC_LZ_MATCH: u32 = MAX3_LZ_MATCH + 3;
 pub const LOW_DIST_REP_COUNT: u32 = 16;
 pub const NC: usize = 306;
-pub const DCB: usize = 64;
-pub const DCX: usize = 80;
-pub const LDC: usize = 16;
-pub const RC: usize = 44;
-pub const HUFF_TABLE_SIZEB: usize = NC + DCB + RC + LDC;
-pub const HUFF_TABLE_SIZEX: usize = NC + DCX + RC + LDC;
 pub const BC: usize = 20;
 pub const NC30: usize = 299;
 pub const DC30: usize = 60;
@@ -55,11 +46,6 @@ pub const BC20: usize = 19;
 pub const MC20: usize = 257;
 pub const LARGEST_TABLE_SIZE: usize = 306;
 
-pub const FILTER_DELTA: u8 = 0;
-pub const FILTER_E8: u8 = 1;
-pub const FILTER_E8E9: u8 = 2;
-pub const FILTER_ARM: u8 = 3;
-pub const FILTER_NONE: u8 = 10;
 
 #[derive(Clone)]
 pub struct DecodeTable {
@@ -103,15 +89,6 @@ pub struct UnpackBlockTables {
     pub ldd: DecodeTable,
     pub rd: DecodeTable,
     pub bd: DecodeTable,
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct UnpackFilter {
-    pub filter_type: u8,
-    pub channels: u8,
-    pub next_window: bool,
-    pub block_start: usize,
-    pub block_length: u32,
 }
 
 #[derive(Clone, Default)]
@@ -158,9 +135,6 @@ pub(crate) fn alloc_zeroed(size: usize) -> Result<Vec<u8>, AllocError> {
 
 pub struct Unpack {
     inp: BitInput,
-    filter_src_memory: Vec<u8>,
-    filter_dst_memory: Vec<u8>,
-    filters: Vec<UnpackFilter>,
     old_dist: [usize; 4],
     old_dist_ptr: usize,
     last_length: u32,
@@ -222,7 +196,6 @@ pub struct Unpack {
     unp_block_ppm: bool,
     tables_read2: bool,
     tables_read3: bool,
-    tables_read5: bool,
     vm: RarVM,
     vm_code_inp: BitInput,
     filters30: Vec<UnpackFilter30>,
@@ -231,13 +204,11 @@ pub struct Unpack {
     last_filter: u32,
 
     max_user_threads: u32,
-    read_buf_mt: Vec<u8>,
-    unp_thread_data: Vec<v50mt::ThreadData>,
+    rar5: rar5::Rar5,
 
     pub alloc_win_size: u64,
     pub max_win_size: usize,
     pub max_win_mask: usize,
-    pub extra_dist: bool,
 }
 
 /// Fill the input buffer, moving unprocessed data to its beginning.
@@ -325,9 +296,6 @@ impl Unpack {
     pub fn new() -> Self {
         let mut u = Unpack {
             inp: BitInput::new(),
-            filter_src_memory: Vec::new(),
-            filter_dst_memory: Vec::new(),
-            filters: Vec::new(),
             old_dist: [0; 4],
             old_dist_ptr: 0,
             last_length: 0,
@@ -383,7 +351,6 @@ impl Unpack {
             unp_block_ppm: false,
             tables_read2: false,
             tables_read3: false,
-            tables_read5: false,
             vm: RarVM::new(),
             vm_code_inp: BitInput::new(),
             filters30: Vec::new(),
@@ -391,12 +358,10 @@ impl Unpack {
             old_filter_lengths: Vec::new(),
             last_filter: 0,
             max_user_threads: 1,
-            read_buf_mt: Vec::new(),
-            unp_thread_data: Vec::new(),
+            rar5: rar5::Rar5::default(),
             alloc_win_size: 0,
             max_win_size: 0,
             max_win_mask: 0,
-            extra_dist: false,
         };
         u.unp_init_data(false);
         u.unp_init_data15(false);
@@ -430,6 +395,10 @@ impl Unpack {
         Ok(())
     }
 
+    pub fn set_threads(&mut self, threads: u32) {
+        self.max_user_threads = threads.clamp(1, 8);
+    }
+
     pub fn set_dest_size(&mut self, size: i64) {
         self.dest_unp_size = size;
         self.file_extracted = false;
@@ -452,25 +421,16 @@ impl Unpack {
             20 | 26 => self.unpack20(solid, io),
             29 => self.unpack29(solid, io),
             50 | 70 => {
-                self.extra_dist = method == 70;
-                if self.max_user_threads > 1 {
-                    self.unpack5_mt(solid, io);
-                } else {
-                    self.unpack5(solid, io);
-                }
+                let mut win = std::mem::take(&mut self.window);
+                let n = self.max_win_size.min(win.len());
+                self.rar5.unpack(&mut win[..n], solid, method == 70, self.dest_unp_size, io);
+                self.window = win;
+                self.file_extracted = true;
             }
             _ => {}
         }
     }
 
-    #[inline(always)]
-    fn wrap_down(&self, p: usize) -> usize {
-        if p >= self.max_win_size {
-            p.wrapping_add(self.max_win_size)
-        } else {
-            p
-        }
-    }
 
     #[inline(always)]
     fn wrap_up(&self, p: usize) -> usize {
@@ -494,7 +454,6 @@ impl Unpack {
             self.first_win_done = false;
             self.write_border = self.max_win_size.min(UNPACK_MAX_WRITE);
         }
-        self.filters.clear();
         self.inp.init_bit_input();
         self.written_file_size = 0;
         self.read_top = 0;
@@ -502,9 +461,6 @@ impl Unpack {
         self.block_header = UnpackBlockHeader { block_size: -1, ..Default::default() };
         self.unp_init_data20(solid);
         self.unp_init_data30(solid);
-        if !solid {
-            self.tables_read5 = false;
-        }
     }
 
     /// Build Huffman decoding tables from bit lengths.
@@ -637,22 +593,6 @@ impl Unpack {
         }
     }
 
-    #[inline(always)]
-    fn slot_to_length(inp: &mut BitInput, slot: u32) -> u32 {
-        let (lbits, mut length);
-        if slot < 8 {
-            lbits = 0;
-            length = 2 + slot;
-        } else {
-            lbits = slot / 4 - 1;
-            length = 2 + ((4 | (slot & 3)) << lbits);
-        }
-        if lbits > 0 {
-            length += inp.getbits() >> (16 - lbits);
-            inp.addbits(lbits);
-        }
-        length
-    }
 
     /// Fill the input buffer (RAR 5.0 version, also used for RAR 1.5-2.x).
     fn unp_read_buf(&mut self, io: &mut dyn UnpackIo) -> bool {
