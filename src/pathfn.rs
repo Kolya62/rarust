@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Path and file name helpers.
+//! File name and path helpers: name and extension parts, volume names,
+//! sanitizing names from archives, and archive names generated from the
+//! current date.
 
-use crate::strfn::{atoiw, wcsicomp_eq};
+use crate::strfn::{atoiw, toupperw, wcsicomp_eq};
 
 #[cfg(unix)]
 pub const CPATHDIVIDER: char = '/';
 #[cfg(not(unix))]
 pub const CPATHDIVIDER: char = '\\';
 
+/// Path separator of this system; Windows accepts both slashes.
 pub fn is_path_div(c: char) -> bool {
-    if cfg!(unix) {
-        c == CPATHDIVIDER
-    } else {
-        c == '\\' || c == '/'
-    }
+    c == CPATHDIVIDER || (!cfg!(unix) && c == '/')
 }
 
 pub fn is_drive_div(c: char) -> bool {
@@ -25,42 +24,33 @@ pub(crate) fn chars(s: &str) -> Vec<char> {
     s.chars().collect()
 }
 
+/// Character at `i`, or NUL past the end.
 pub(crate) fn at(v: &[char], i: usize) -> char {
     v.get(i).copied().unwrap_or('\0')
 }
 
+/// "X:" at the start of the path (Windows only).
 pub fn is_drive_letter(path: &str) -> bool {
-    let v: Vec<char> = path.chars().take(2).collect();
-    if v.len() < 2 {
-        return false;
-    }
-    let l = v[0].to_ascii_uppercase();
-    l.is_ascii_uppercase() && is_drive_div(v[1])
+    let mut c = path.chars();
+    matches!((c.next(), c.next()), (Some(l), Some(d)) if l.is_ascii_alphabetic() && is_drive_div(d))
 }
 
-/// Character position where the name part starts.
+/// Index of the first character of the name part.
 pub fn get_name_pos_c(p: &[char]) -> usize {
-    for i in (0..p.len()).rev() {
-        if is_path_div(p[i]) {
-            return i + 1;
-        }
-    }
-    if p.len() >= 2 && p[0].is_ascii_alphabetic() && is_drive_div(p[1]) {
-        2
-    } else {
-        0
+    match p.iter().rposition(|&c| is_path_div(c)) {
+        Some(i) => i + 1,
+        None if p.len() >= 2 && p[0].is_ascii_alphabetic() && is_drive_div(p[1]) => 2,
+        None => 0,
     }
 }
 
-/// Byte position where the name part starts.
+/// Byte index of the name part.
 pub fn get_name_pos(path: &str) -> usize {
-    let v = chars(path);
-    let cp = get_name_pos_c(&v);
-    char_to_byte(path, cp)
-}
-
-fn char_to_byte(s: &str, cp: usize) -> usize {
-    s.char_indices().nth(cp).map(|(b, _)| b).unwrap_or(s.len())
+    match path.char_indices().filter(|&(_, c)| is_path_div(c)).last() {
+        Some((i, c)) => i + c.len_utf8(),
+        None if is_drive_letter(path) => path.char_indices().nth(2).map_or(path.len(), |(i, _)| i),
+        None => 0,
+    }
 }
 
 pub fn point_to_name(path: &str) -> &str {
@@ -71,82 +61,71 @@ pub fn get_last_char(path: &str) -> char {
     path.chars().last().unwrap_or('\0')
 }
 
-/// Remove dangerous path prefixes and "..". Returns the number of removed
-/// characters and the converted path.
+/// Makes a path from an archive safe to use below the destination:
+/// drops everything up to the last "/../" (or a trailing "/.."), then
+/// any drive, UNC "//server/share/" and leading separators and dots, and
+/// finally a remaining ".." name. Returns the number of removed
+/// characters and the result.
 pub fn convert_path(src: &str) -> (usize, String) {
     let s = chars(src);
-    let mut dest_pos = 0usize;
-    for i in 0..s.len() {
-        if is_path_div(s[i]) && at(&s, i + 1) == '.' && at(&s, i + 2) == '.' && (is_path_div(at(&s, i + 3)) || at(&s, i + 3) == '\0') {
-            dest_pos = if at(&s, i + 3) == '\0' { i + 3 } else { i + 4 };
+    let n = s.len();
+    let mut start = 0;
+    for i in 0..n {
+        let dotdot = is_path_div(s[i]) && at(&s, i + 1) == '.' && at(&s, i + 2) == '.';
+        if dotdot && (i + 3 == n || is_path_div(at(&s, i + 3))) {
+            start = (i + 4).min(n);
         }
     }
-    while dest_pos < s.len() {
-        let mut i = dest_pos;
-        if i + 1 < s.len() && is_drive_div(s[i + 1]) {
+    loop {
+        let mut i = start;
+        if i + 1 < n && is_drive_div(s[i + 1]) {
             i += 2;
         }
         if is_path_div(at(&s, i)) && is_path_div(at(&s, i + 1)) {
-            let mut slash_count = 0;
-            for j in i + 2..s.len() {
-                if is_path_div(s[j]) {
-                    slash_count += 1;
-                    if slash_count == 2 {
-                        i = j + 1;
-                        break;
-                    }
-                }
+            // Skip "\\server\share\".
+            if let Some(k) = s[i + 2..].iter().enumerate().filter(|&(_, &c)| is_path_div(c)).nth(1).map(|(k, _)| k) {
+                i += 2 + k + 1;
             }
         }
-        for j in i..s.len() {
-            if is_path_div(s[j]) {
+        // Leading separators and dots, up to the last separator among them.
+        for (j, &c) in s.iter().enumerate().skip(i) {
+            if is_path_div(c) {
                 i = j + 1;
-            } else if s[j] != '.' {
+            } else if c != '.' {
                 break;
             }
         }
-        if i == dest_pos {
+        if i == start || start >= n {
             break;
         }
-        dest_pos = i;
+        start = i;
     }
-    let mut dest_pos = dest_pos.min(s.len());
-    // Code above does not remove the last "..", like in a name consisting
-    // of ".." only. Such name would refer to the parent of destination.
-    if s.len() - dest_pos == 2 && s[dest_pos] == '.' && s[dest_pos + 1] == '.' {
-        dest_pos += 2;
+    let mut start = start.min(n);
+    if n - start == 2 && s[start] == '.' && s[start + 1] == '.' {
+        start = n;
     }
-    (dest_pos, s[dest_pos..].iter().collect())
+    (start, s[start..].iter().collect())
 }
 
 pub fn set_name(full: &mut String, name: &str) {
-    let p = get_name_pos(full);
-    full.truncate(p);
+    full.truncate(get_name_pos(full));
     full.push_str(name);
 }
 
+/// Byte position of the extension dot in the name part.
 pub fn get_ext_pos(name: &str) -> Option<usize> {
-    let np = get_name_pos(name);
-    match name.rfind('.') {
-        Some(d) if d >= np => Some(d),
-        _ => None,
-    }
+    name.rfind('.').filter(|&d| d >= get_name_pos(name))
 }
 
-/// Extension with the leading dot or empty string.
+/// Extension including the dot, or "".
 pub fn get_ext(name: &str) -> &str {
-    match get_ext_pos(name) {
-        Some(p) => &name[p..],
-        None => "",
-    }
+    get_ext_pos(name).map_or("", |p| &name[p..])
 }
 
-pub fn set_ext(name: &mut String, new_ext: &str) {
-    if let Some(p) = get_ext_pos(name) {
-        name.truncate(p);
-    }
+pub fn set_ext(name: &mut String, ext: &str) {
+    remove_ext(name);
     name.push('.');
-    name.push_str(new_ext);
+    name.push_str(ext);
 }
 
 pub fn remove_ext(name: &mut String) {
@@ -155,7 +134,7 @@ pub fn remove_ext(name: &mut String) {
     }
 }
 
-/// Compare extension without the leading dot, case insensitive.
+/// Extension (without the dot) equals `ext`, ignoring case.
 pub fn cmp_ext(name: &str, ext: &str) -> bool {
     match get_ext_pos(name) {
         None => ext.is_empty(),
@@ -164,7 +143,7 @@ pub fn cmp_ext(name: &str, ext: &str) -> bool {
 }
 
 pub fn is_wildcard(s: &str) -> bool {
-    s.contains('*') || s.contains('?')
+    s.contains(['*', '?'])
 }
 
 pub fn add_end_slash(path: &mut String) {
@@ -173,88 +152,93 @@ pub fn add_end_slash(path: &mut String) {
     }
 }
 
+/// `path` + separator + `name`; a bare drive "X:" gets no separator.
 pub fn make_name(path: &str, name: &str) -> String {
     let mut out = path.to_string();
-    if !is_drive_letter(path) || path.chars().count() > 2 {
+    if !(is_drive_letter(path) && path.chars().count() == 2) {
         add_end_slash(&mut out);
     }
-    out.push_str(name);
-    out
+    out + name
 }
 
-/// File path including the trailing separator.
+/// Path part including the trailing separator.
 pub fn get_path_with_sep(full: &str) -> String {
     full[..get_name_pos(full)].to_string()
 }
 
+/// Leaves the path without the name and its separator, keeping the root
+/// separator of "/name" and "X:\name".
 pub fn remove_name_from_path(path: &mut String) {
     let v = chars(path);
     let mut np = get_name_pos_c(&v);
     if np >= 2 && (!is_drive_div(v[1]) || np >= 4) {
         np -= 1;
     }
-    path.truncate(char_to_byte(path, np));
+    let byte = path.char_indices().nth(np).map_or(path.len(), |(i, _)| i);
+    path.truncate(byte);
 }
 
+/// Position of the last digit of the volume number in "name.partNN.rar"
+/// style names: normally the last digit of the name part.
 pub fn get_vol_num_pos(arc: &[char]) -> usize {
-    let name_pos = get_name_pos_c(arc);
-    if name_pos == arc.len() {
-        return name_pos;
+    let start = get_name_pos_c(arc);
+    if start == arc.len() {
+        return start;
     }
-    let mut pos = arc.len() - 1;
-    while !arc[pos].is_ascii_digit() && pos > name_pos {
-        pos -= 1;
+    // Last digit of the name (or the start of the name if none).
+    let mut last = arc.len() - 1;
+    while last > start && !arc[last].is_ascii_digit() {
+        last -= 1;
     }
-    let mut num_pos = pos;
-    while arc[num_pos].is_ascii_digit() && num_pos > name_pos {
-        num_pos -= 1;
+    // Skip that digit group.
+    let mut p = last;
+    while p > start && arc[p].is_ascii_digit() {
+        p -= 1;
     }
-    while num_pos > name_pos && arc[num_pos] != '.' {
-        if arc[num_pos].is_ascii_digit() {
-            let dot = arc[name_pos..].iter().position(|&c| c == '.').map(|p| p + name_pos);
-            if let Some(d) = dot {
-                if d < num_pos {
-                    pos = num_pos;
-                }
+    // A digit group before it, within the same dot separated part, wins
+    // if the name has a dot before that group ("a.part1b2.rar" style
+    // names keep the first group).
+    while p > start && arc[p] != '.' {
+        if arc[p].is_ascii_digit() {
+            if arc[start..].iter().position(|&c| c == '.').is_some_and(|d| start + d < p) {
+                last = p;
             }
             break;
         }
-        num_pos -= 1;
+        p -= 1;
     }
-    pos
+    last
 }
 
+/// Name of the next volume: "name.partN.rar" with the number increased,
+/// or for old style numbering .rar, .r00 ... .r99, .s00 ...
 pub fn next_volume_name(arc_name: &mut String, old_numbering: bool) {
-    let mut dot_pos = get_ext_pos(arc_name);
-    match dot_pos {
-        None => {
-            arc_name.push_str(".rar");
-            dot_pos = get_ext_pos(arc_name);
+    match get_ext_pos(arc_name) {
+        None => arc_name.push_str(".rar"),
+        Some(p) if p + 1 == arc_name.len() || cmp_ext(arc_name, "exe") || cmp_ext(arc_name, "sfx") => {
+            set_ext(arc_name, "rar")
         }
-        Some(p) => {
-            if p + 1 == arc_name.len() || cmp_ext(arc_name, "exe") || cmp_ext(arc_name, "sfx") {
-                set_ext(arc_name, "rar");
-                dot_pos = get_ext_pos(arc_name);
-            }
-        }
+        _ => {}
     }
+    let dot_byte = get_ext_pos(arc_name).unwrap();
+    let dot = arc_name[..dot_byte].chars().count();
     let mut v = chars(arc_name);
-    // Convert byte position to char position.
-    let dot = arc_name[..dot_pos.unwrap()].chars().count();
     if !old_numbering {
-        let mut num_pos = get_vol_num_pos(&v);
+        // Decimal increment; a carry out of the leftmost digit inserts 1.
+        let mut i = get_vol_num_pos(&v);
         loop {
-            v[num_pos] = char::from_u32(v[num_pos] as u32 + 1).unwrap_or('0');
-            if v[num_pos] != ':' {
-                break;
-            }
-            v[num_pos] = '0';
-            if num_pos == 0 {
-                break;
-            }
-            num_pos -= 1;
-            if !v[num_pos].is_ascii_digit() {
-                v.insert(num_pos + 1, '1');
+            if v[i] == '9' {
+                v[i] = '0';
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+                if !v[i].is_ascii_digit() {
+                    v.insert(i + 1, '1');
+                    break;
+                }
+            } else {
+                v[i] = char::from_u32(v[i] as u32 + 1).unwrap_or('0');
                 break;
             }
         }
@@ -264,71 +248,64 @@ pub fn next_volume_name(arc_name: &mut String, old_numbering: bool) {
             v.extend("rar".chars());
         }
         if !at(&v, dot + 2).is_ascii_digit() || !at(&v, dot + 3).is_ascii_digit() {
+            // .rar -> .r00
             v.truncate(dot + 2);
             v.extend("00".chars());
         } else {
-            let mut num_pos = v.len() - 1;
+            // Increment the digits; .r99 continues with the next letter.
+            let mut i = v.len() - 1;
             loop {
-                v[num_pos] = char::from_u32(v[num_pos] as u32 + 1).unwrap_or('0');
-                if v[num_pos] != ':' {
+                if v[i] != '9' {
+                    v[i] = char::from_u32(v[i] as u32 + 1).unwrap_or('0');
                     break;
                 }
-                if num_pos == 0 || v[num_pos - 1] == '.' {
-                    v[num_pos] = 'a';
+                if i == 0 || v[i - 1] == '.' {
+                    v[i] = 'a';
                     break;
-                } else {
-                    v[num_pos] = '0';
-                    num_pos -= 1;
                 }
+                v[i] = '0';
+                i -= 1;
             }
         }
     }
     *arc_name = v.into_iter().collect();
 }
 
+/// Name can be created as is in this file system.
 pub fn is_name_usable(name: &str) -> bool {
     let v = chars(name);
-    if cfg!(unix) {
-        if name.contains(':') {
-            return false;
-        }
-    } else if v.iter().skip(2).any(|&c| c == ':') {
+    let colon = if cfg!(unix) { v.contains(&':') } else { v.iter().skip(2).any(|&c| c == ':') };
+    if name.is_empty() || colon || v.iter().any(|&c| (c as u32) < 32 || "?*<>|\"".contains(c)) {
         return false;
     }
-    for i in 0..v.len() {
-        if (v[i] as u32) < 32 {
-            return false;
-        }
-        if cfg!(unix) && (v[i] == ' ' || v[i] == '.') && is_path_div(at(&v, i + 1)) {
-            return false;
-        }
-    }
-    !name.is_empty() && !v.iter().any(|c| "?*<>|\"".contains(*c))
+    // Trailing spaces and dots in path components are trouble for
+    // Windows tools even on Unix.
+    !(cfg!(unix) && v.windows(2).any(|w| (w[0] == ' ' || w[0] == '.') && is_path_div(w[1])))
 }
 
+/// Replaces characters that cannot be used in names by '_'. `extended`
+/// also handles control characters and characters invalid in Windows.
 pub fn make_name_usable(name: &mut String, extended: bool) {
     let mut v = chars(name);
+    let bad = if extended { "?*<>|\"" } else { "?*" };
     for i in 0..v.len() {
-        let bad = if extended { "?*<>|\"" } else { "?*" };
-        if bad.contains(v[i]) || extended && (v[i] as u32) < 32 {
-            v[i] = '_';
-        }
+        let c = v[i];
+        let mut replace = bad.contains(c) || (extended && (c as u32) < 32);
         if cfg!(unix) {
             if extended {
-                if v[i] == ':' {
-                    v[i] = '_';
-                }
-                if is_path_div(at(&v, i + 1))
-                    && (v[i] == ' '
-                        || v[i] == '.'
-                            && i > 0
-                            && !is_path_div(v[i - 1])
-                            && (v[i - 1] != '.' || i > 1 && !is_path_div(v[i - 2])))
-                {
-                    v[i] = '_';
+                replace |= c == ':';
+                // Trailing space or dot of a component, except "." and "..".
+                let before_div = is_path_div(at(&v, i + 1));
+                let lone_dot = i == 0 || is_path_div(v[i - 1]);
+                let dot_dot = v[i - i.min(1)] == '.' && (i == 1 || (i > 1 && is_path_div(v[i - 2])));
+                if before_div && (c == ' ' || (c == '.' && !lone_dot && !dot_dot)) {
+                    replace = true;
                 }
             }
-        } else if i > 1 && v[i] == ':' {
+        } else if i > 1 && c == ':' {
+            replace = true;
+        }
+        if replace {
             v[i] = '_';
         }
     }
@@ -343,7 +320,6 @@ pub fn dos_slash_to_unix(s: &str) -> String {
     s.replace('\\', "/")
 }
 
-/// Convert both slash types to native path separator.
 pub fn slash_to_native(s: &str) -> String {
     if cfg!(unix) {
         dos_slash_to_unix(s)
@@ -352,24 +328,23 @@ pub fn slash_to_native(s: &str) -> String {
     }
 }
 
+/// Absolute path: "/..." on Unix, "\\server..." or "X:\..." on Windows.
 pub fn is_full_path(path: &str) -> bool {
     let v = chars(path);
     if cfg!(unix) {
-        !v.is_empty() && is_path_div(v[0])
+        v.first().is_some_and(|&c| is_path_div(c))
     } else {
-        v.len() >= 2 && v[0] == '\\' && v[1] == '\\' || v.len() >= 3 && is_drive_letter(path) && is_path_div(v[2])
+        v.starts_with(&['\\', '\\']) || (v.len() >= 3 && is_drive_letter(path) && is_path_div(v[2]))
     }
 }
 
+/// Absolute path or a path from the root of the current drive.
 pub fn is_full_root_path(path: &str) -> bool {
-    is_full_path(path) || path.chars().next().map(is_path_div).unwrap_or(false)
+    is_full_path(path) || path.chars().next().is_some_and(is_path_div)
 }
 
 pub fn convert_name_to_full(src: &str) -> String {
-    if src.is_empty() {
-        return String::new();
-    }
-    if is_full_path(src) {
+    if src.is_empty() || is_full_path(src) {
         return src.to_string();
     }
     let mut d = std::env::current_dir().map(|p| crate::unicode::from_os(p.as_os_str())).unwrap_or_default();
@@ -377,45 +352,47 @@ pub fn convert_name_to_full(src: &str) -> String {
     d + src
 }
 
-/// Parse "name;ver" version suffix. Returns version and optionally truncates.
+/// Version of "name;N" file names; with `truncate` the suffix is removed.
 pub fn parse_version_file_name(name: &mut String, truncate: bool) -> i32 {
-    let mut version = 0;
-    if let Some(p) = name.rfind(';') {
-        if p + 1 < name.len() {
-            version = atoiw(&name[p + 1..]) as i32;
+    match name.rfind(';') {
+        Some(p) if p + 1 < name.len() => {
+            let v = atoiw(&name[p + 1..]) as i32;
             if truncate {
                 name.truncate(p);
             }
+            v
         }
+        _ => 0,
     }
-    version
 }
 
-/// Get the name of first volume. Returns name and the leftmost digit
-/// position of volume number.
+/// Name of the first volume of a volume set, and the position of the
+/// leftmost digit of the volume number. If that file does not exist, the
+/// directory is searched for a first volume with the same base name.
 pub fn vol_name_to_first_name(vol_name: &str, new_numbering: bool) -> (String, usize) {
-    let mut v = chars(vol_name);
-    let mut vol_num_start = 0;
-    let mut name;
-    if new_numbering {
-        let mut n = '1';
+    let mut num_start = 0;
+    let mut name = if new_numbering {
+        // Replace the number by 1, 01, 001...
+        let mut v = chars(vol_name);
+        let mut digit = '1';
         let mut pos = get_vol_num_pos(&v);
         while pos > 0 {
             if v[pos].is_ascii_digit() {
-                v[pos] = n;
-                n = '0';
-            } else if n == '0' {
-                vol_num_start = pos + 1;
+                v[pos] = digit;
+                digit = '0';
+            } else if digit == '0' {
+                num_start = pos + 1;
                 break;
             }
             pos -= 1;
         }
-        name = v.into_iter().collect::<String>();
+        v.into_iter().collect()
     } else {
-        name = vol_name.to_string();
-        set_ext(&mut name, "rar");
-        vol_num_start = get_ext_pos(&name).unwrap_or(0);
-    }
+        let mut n = vol_name.to_string();
+        set_ext(&mut n, "rar");
+        num_start = get_ext_pos(&n).unwrap_or(0);
+        n
+    };
     if !crate::filefn::file_exist(&name) {
         let mut mask = name.clone();
         set_ext(&mut mask, "*");
@@ -431,286 +408,272 @@ pub fn vol_name_to_first_name(vol_name: &str, new_numbering: bool) -> (String, u
             }
         }
     }
-    (name, vol_num_start)
+    (name, num_start)
 }
 
-fn gen_arc_name(arc_name: &mut String, generate_mask: &str, arc_number: u32, arc_num_present: &mut bool) {
-    use crate::strfn::{get_digits, toupperw};
-    let gm = chars(generate_mask);
-    let mut pos = 0;
-    let mut prefix = false;
-    if at(&gm, 0) == '+' {
-        prefix = true;
-        pos += 1;
-    }
-    let mut mask: Vec<char> = if gm.len() > pos { gm[pos..].to_vec() } else { chars("yyyymmddhhmmss") };
-    let mut quote = false;
-    let mut m_as_minutes = 0;
+/// Date fields of archive name masks: letter, value, alignment. Right
+/// aligned fields take their last characters when the mask repeats the
+/// letter fewer times than the field is long; left aligned (names) take
+/// the first ones.
+struct DateField {
+    letter: char,
+    text: Vec<char>,
+    right: bool,
+}
+
+/// Expands an archive name mask like "yyyymmdd" or "+{arc}nnn". Letters:
+/// Y year, M month (or minutes after H), D day, H hour, I minutes, S
+/// seconds, W week, A weekday number, E day of year, N archive number,
+/// K weekday name, O month name ("MMM" or longer). "{...}" is literal
+/// text; a leading "+" puts the date before the name.
+fn gen_arc_name(arc_name: &mut String, generate_mask: &str, arc_number: u32, has_number: &mut bool) {
+    let (prefix, mask) = match generate_mask.strip_prefix('+') {
+        Some(m) => (true, m),
+        None => (false, generate_mask),
+    };
+    let mut mask = chars(if mask.is_empty() { "yyyymmddhhmmss" } else { mask });
+
+    // Normalize letters: minutes, month names and enough N for the number.
+    let mut quoted = false;
+    let mut minutes_left = 0;
     let mut i = 0;
     while i < mask.len() {
-        if mask[i] == '{' || mask[i] == '}' {
-            quote = mask[i] == '{';
+        let c = mask[i];
+        if c == '{' || c == '}' {
+            quoted = c == '{';
             i += 1;
             continue;
         }
-        if quote {
+        if quoted {
             i += 1;
             continue;
         }
-        let cur = toupperw(mask[i]);
-        if cur == 'H' {
-            m_as_minutes = 2;
+        match toupperw(c) {
+            'H' => minutes_left = 2,
+            'D' | 'Y' => minutes_left = 0,
+            _ => {}
         }
-        if cur == 'D' || cur == 'Y' {
-            m_as_minutes = 0;
-        }
-        if cur == 'M' {
-            if m_as_minutes > 0 {
+        match toupperw(c) {
+            'M' if minutes_left > 0 => {
                 mask[i] = 'I';
-                m_as_minutes -= 1;
-            } else if i + 2 < mask.len() && toupperw(mask[i + 1]) == 'M' && toupperw(mask[i + 2]) == 'M' {
+                minutes_left -= 1;
+            }
+            'M' if (1..3).all(|k| toupperw(at(&mask, i + k)) == 'M') => {
                 let mut j = i;
                 while j < mask.len() && toupperw(mask[j]) == 'M' {
                     mask[j] = 'O';
                     j += 1;
                 }
             }
-        }
-        if cur == 'N' {
-            let digits = get_digits(arc_number) as usize;
-            let mut ncount = 0;
-            while toupperw(at(&mask, i + ncount)) == 'N' {
-                ncount += 1;
-            }
-            if ncount < digits {
-                for _ in 0..digits - ncount {
+            'N' => {
+                let digits = crate::strfn::get_digits(arc_number) as usize;
+                let run = mask[i..].iter().take_while(|&&c| toupperw(c) == 'N').count();
+                for _ in run..digits {
                     mask.insert(i, 'N');
                 }
+                i += digits.max(run);
+                *has_number = true;
+                continue;
             }
-            i += digits.max(ncount) - 1;
-            *arc_num_present = true;
-            i += 1;
-            continue;
+            _ => {}
         }
         i += 1;
     }
-    let mut cur_time = crate::timefn::RarTime::default();
-    cur_time.set_current_time();
-    let rlt = cur_time.get_local();
-    let ext;
-    match get_ext_pos(arc_name) {
-        None => ext = if point_to_name(arc_name).is_empty() { ".rar".to_string() } else { String::new() },
+
+    let mut now = crate::timefn::RarTime::default();
+    now.set_current_time();
+    let t = now.get_local();
+    let ext = match get_ext_pos(arc_name) {
         Some(p) => {
-            ext = arc_name[p..].to_string();
+            let e = arc_name[p..].to_string();
             arc_name.truncate(p);
+            e
         }
-    }
-    let week_day: i32 = if rlt.wday == 0 { 6 } else { rlt.wday as i32 - 1 };
-    let mut start_week_day = rlt.yday as i32 - week_day;
-    if start_week_day < 0 {
-        if start_week_day <= -4 {
-            start_week_day += if crate::timefn::is_leap_year(rlt.year - 1) { 366 } else { 365 };
+        None if point_to_name(arc_name).is_empty() => ".rar".to_string(),
+        None => String::new(),
+    };
+    // ISO 8601 week: weeks start on Monday, week 1 has the year's first
+    // Thursday.
+    let weekday = if t.wday == 0 { 6 } else { t.wday as i32 - 1 };
+    let mut week_start = t.yday as i32 - weekday;
+    if week_start < 0 {
+        week_start = if week_start <= -4 {
+            week_start + if crate::timefn::is_leap_year(t.year - 1) { 366 } else { 365 }
         } else {
-            start_week_day = 0;
-        }
+            0
+        };
     }
-    let mut cur_week = start_week_day / 7 + 1;
-    if start_week_day % 7 >= 4 {
-        cur_week += 1;
-    }
-    let field: Vec<Vec<char>> = vec![
-        chars(&format!("{:04}", rlt.year)),
-        chars(&format!("{:02}", rlt.month)),
-        chars(&format!("{:02}", rlt.day)),
-        chars(&format!("{:02}", rlt.hour)),
-        chars(&format!("{:02}", rlt.minute)),
-        chars(&format!("{:02}", rlt.second)),
-        chars(&format!("{:02}", cur_week)),
-        chars(&format!("{}", week_day + 1)),
-        chars(&format!("{:03}", rlt.yday + 1)),
-        chars(&format!("{:05}", arc_number)),
-        chars(crate::ui::ui_get_week_day_name(rlt.wday)).into_iter().take(19).collect(),
-        chars(crate::ui::ui_get_month_name(rlt.month - 1)).into_iter().take(19).collect(),
+    let week = week_start / 7 + 1 + (week_start % 7 >= 4) as i32;
+    let name_field = |s: &str| s.chars().take(19).collect::<Vec<char>>();
+    let mut fields = [
+        DateField { letter: 'Y', text: chars(&format!("{:04}", t.year)), right: true },
+        DateField { letter: 'M', text: chars(&format!("{:02}", t.month)), right: true },
+        DateField { letter: 'D', text: chars(&format!("{:02}", t.day)), right: true },
+        DateField { letter: 'H', text: chars(&format!("{:02}", t.hour)), right: true },
+        DateField { letter: 'I', text: chars(&format!("{:02}", t.minute)), right: true },
+        DateField { letter: 'S', text: chars(&format!("{:02}", t.second)), right: true },
+        DateField { letter: 'W', text: chars(&format!("{week:02}")), right: true },
+        DateField { letter: 'A', text: chars(&format!("{}", weekday + 1)), right: true },
+        DateField { letter: 'E', text: chars(&format!("{:03}", t.yday + 1)), right: true },
+        DateField { letter: 'N', text: chars(&format!("{arc_number:05}")), right: true },
+        DateField { letter: 'K', text: name_field(crate::ui::ui_get_week_day_name(t.wday)), right: false },
+        DateField { letter: 'O', text: name_field(crate::ui::ui_get_month_name(t.month - 1)), right: false },
     ];
-    let lfield: Vec<i32> = field.iter().map(|f| f.len() as i32).collect();
-    let mask_chars = chars("YMDHISWAENKO");
-    let mask_align = chars("RRRRRRRRRRLL");
-    let mut cfield = [0i32; 12];
-    quote = false;
+    let field_of = |c: char, fields: &[DateField]| fields.iter().position(|f| f.letter == toupperw(c));
+
+    // For right aligned fields count how many characters the mask wants.
+    let mut used = [0usize; 12];
+    let mut quoted = false;
     for &c in &mask {
         if c == '{' || c == '}' {
-            quote = c == '{';
-            continue;
-        }
-        if quote {
-            continue;
-        }
-        if let Some(fp) = mask_chars.iter().position(|&m| m == toupperw(c)) {
-            if mask_align[fp] == 'R' && cfield[fp] < lfield[fp] {
-                cfield[fp] += 1;
+            quoted = c == '{';
+        } else if !quoted {
+            if let Some(f) = field_of(c, &fields) {
+                if fields[f].right && used[f] < fields[f].text.len() {
+                    used[f] += 1;
+                }
             }
         }
     }
-    let mut date_text = String::new();
-    quote = false;
+    let mut text = String::new();
+    let mut quoted = false;
+    let mut taken = [0usize; 12];
     for &c in &mask {
-        if date_text.chars().count() >= 127 {
+        if text.chars().count() >= 127 {
             break;
         }
         if c == '{' || c == '}' {
-            quote = c == '{';
+            quoted = c == '{';
             continue;
         }
-        let fp = mask_chars.iter().position(|&m| m == toupperw(c));
-        match fp {
-            Some(fp) if !quote => {
-                if mask_align[fp] == 'L' {
-                    if cfield[fp] < lfield[fp] {
-                        date_text.push(field[fp][cfield[fp] as usize]);
-                        cfield[fp] += 1;
+        match field_of(c, &fields).filter(|_| !quoted) {
+            Some(f) => {
+                let fd = &mut fields[f];
+                if fd.right {
+                    // The last `used` characters of the field, then nothing.
+                    let idx = fd.text.len() as isize - (used[f] as isize - taken[f] as isize);
+                    taken[f] += 1;
+                    if idx >= 0 {
+                        if let Some(&ch) = fd.text.get(idx as usize) {
+                            text.push(ch);
+                        }
                     }
-                } else if cfield[fp] >= 0 {
-                    let idx = lfield[fp] - cfield[fp];
-                    cfield[fp] -= 1;
-                    if let Some(&ch) = field[fp].get(idx as usize) {
-                        date_text.push(ch);
-                    }
+                } else if taken[f] < fd.text.len() {
+                    text.push(fd.text[taken[f]]);
+                    taken[f] += 1;
                 }
             }
-            _ => {
-                let ch = if !cfg!(unix) && c == ':' { '_' } else { c };
-                date_text.push(ch);
-            }
+            None => text.push(if !cfg!(unix) && c == ':' { '_' } else { c }),
         }
     }
     if prefix {
-        let mut new_name = get_path_with_sep(arc_name);
-        new_name.push_str(&date_text);
-        new_name.push_str(point_to_name(arc_name));
-        *arc_name = new_name;
+        let n = point_to_name(arc_name).to_string();
+        *arc_name = get_path_with_sep(arc_name) + &text + &n;
     } else {
-        arc_name.push_str(&date_text);
+        arc_name.push_str(&text);
     }
     arc_name.push_str(&ext);
 }
 
+/// Applies a name mask, choosing the first unused archive number if the
+/// mask has one (the last existing one when not archiving).
 pub fn generate_archive_name(arc_name: &mut String, generate_mask: &str, archiving: bool) {
-    let mut arc_number = 1;
-    let mut new_name;
+    let mut number = 1;
     loop {
-        new_name = arc_name.clone();
-        let mut present = false;
-        gen_arc_name(&mut new_name, generate_mask, arc_number, &mut present);
-        if !present {
-            break;
+        let mut name = arc_name.clone();
+        let mut has_number = false;
+        gen_arc_name(&mut name, generate_mask, number, &mut has_number);
+        if !has_number {
+            *arc_name = name;
+            return;
         }
-        if !crate::filefn::file_exist(&new_name) {
-            if !archiving && arc_number > 1 {
-                new_name = arc_name.clone();
-                gen_arc_name(&mut new_name, generate_mask, arc_number - 1, &mut present);
+        if !crate::filefn::file_exist(&name) {
+            if !archiving && number > 1 {
+                name = arc_name.clone();
+                gen_arc_name(&mut name, generate_mask, number - 1, &mut has_number);
             }
-            break;
+            *arc_name = name;
+            return;
         }
-        arc_number += 1;
+        number += 1;
     }
-    *arc_name = new_name;
 }
 
-/// Enumerate configuration file paths.
+/// Directories searched for configuration files, in order.
 pub fn enum_config_paths(number: u32) -> Option<String> {
-    const CONF: [&str; 5] = ["/etc", "/etc/rar", "/usr/lib", "/usr/local/lib", "/usr/local/etc"];
+    const SYSTEM: [&str; 5] = ["/etc", "/etc/rar", "/usr/lib", "/usr/local/lib", "/usr/local/etc"];
     let home = std::env::var_os("HOME").map(|h| crate::unicode::from_os(&h));
-    if number == 0 {
-        return Some(home.unwrap_or_else(|| CONF[0].to_string()));
-    }
-    if number == 1 {
-        if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !x.is_empty() {
-                return Some(make_name(&crate::unicode::from_os(&x), "rar"));
-            }
+    match number {
+        0 => Some(home.unwrap_or_else(|| SYSTEM[0].to_string())),
+        1 => {
+            let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty());
+            Some(match (xdg, home) {
+                (Some(x), _) => make_name(&crate::unicode::from_os(&x), "rar"),
+                (None, Some(h)) => make_name(&h, ".config/rar"),
+                (None, None) => SYSTEM[0].to_string(),
+            })
         }
-        return Some(match home {
-            Some(h) => make_name(&h, ".config/rar"),
-            None => CONF[0].to_string(),
-        });
+        n => SYSTEM.get(n as usize - 2).map(|s| s.to_string()),
     }
-    CONF.get((number - 2) as usize).map(|s| s.to_string())
 }
 
+/// First configuration path containing `name` (or the last candidate).
 pub fn get_config_name(name: &str, check_exist: bool) -> String {
     let mut full = String::new();
-    let mut i = 0;
-    while let Some(p) = enum_config_paths(i) {
+    for p in (0..).map_while(enum_config_paths) {
         full = make_name(&p, name);
         if !check_exist || crate::filefn::wild_file_exist(&full) {
             break;
         }
-        i += 1;
     }
     full
 }
 
-/// Make the name acceptable for Windows: replace trailing dots and spaces
-/// in path components and prefix reserved device names with '_'.
+/// Adapts a name for Windows: trailing dots and spaces of components
+/// become '_' (except "." and ".."), and reserved device names like
+/// "CON" or "COM1" get a '_' prefix.
 pub fn make_name_compatible(name: &mut String) {
+    let drive = is_drive_letter(name);
     let mut v = chars(name);
     let n = v.len();
     for i in 0..n {
-        if i + 1 == n || is_path_div(v[i + 1]) {
-            let c = v[i];
-            if c == '.' || c == ' ' {
-                if c == '.' {
-                    let drive = is_drive_letter(name);
-                    if i == 0 || is_path_div(v[i - 1]) || i == 2 && drive {
-                        continue;
-                    }
-                    if i >= 1 && v[i - 1] == '.' && (i == 1 || is_path_div(v[i - 2]) || i == 3 && drive) {
-                        continue;
-                    }
-                }
-                v[i] = '_';
+        let c = v[i];
+        if !(i + 1 == n || is_path_div(v[i + 1])) || (c != '.' && c != ' ') {
+            continue;
+        }
+        if c == '.' {
+            let component_start = |k: usize| k == 0 || is_path_div(v[k - 1]) || (k == 2 && drive);
+            if component_start(i) || (i >= 1 && v[i - 1] == '.' && component_start(i - 1)) {
+                continue;
             }
         }
+        v[i] = '_';
     }
     const DEVICES: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "COM#", "LPT#"];
+    let is_device = |v: &[char], i: usize| {
+        DEVICES.iter().any(|d| {
+            let ok = d.chars().enumerate().all(|(k, dc)| {
+                let c = at(v, i + k);
+                if dc == '#' {
+                    c.is_ascii_digit()
+                } else {
+                    c.to_ascii_uppercase() == dc
+                }
+            });
+            // "aux.txt" works in Windows 11, "aux" alone does not.
+            let after = at(v, i + d.len());
+            ok && (after == '\0' || is_path_div(after))
+        })
+    };
     let mut i = 0;
     while i < v.len() {
-        if i == 0 || is_path_div(v[i - 1]) {
-            let mut found = false;
-            for d in DEVICES {
-                let dc: Vec<char> = d.chars().collect();
-                let mut k = 0;
-                let mut ok = true;
-                while k < dc.len() {
-                    let c = at(&v, i + k);
-                    if dc[k] == '#' {
-                        if !c.is_ascii_digit() {
-                            ok = false;
-                            break;
-                        }
-                    } else if dc[k] != c.to_ascii_uppercase() {
-                        ok = false;
-                        break;
-                    }
-                    k += 1;
-                }
-                if ok {
-                    let c = at(&v, i + k);
-                    // Names like aux.txt are accessible in Windows 11, pure aux is not.
-                    if c == '\0' || is_path_div(c) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if found {
-                let orig: String = v.iter().collect();
-                v.insert(i, '_');
-                let new: String = v.iter().collect();
-                crate::ui::ui_msg(crate::ui::UiMsg::CorrectingName(String::new()));
-                crate::ui::ui_msg(crate::ui::UiMsg::Renaming(String::new(), orig, new));
-                i += 1;
-            }
+        if (i == 0 || is_path_div(v[i - 1])) && is_device(&v, i) {
+            let orig: String = v.iter().collect();
+            v.insert(i, '_');
+            let new: String = v.iter().collect();
+            crate::ui::ui_msg(crate::ui::UiMsg::CorrectingName(String::new()));
+            crate::ui::ui_msg(crate::ui::UiMsg::Renaming(String::new(), orig, new));
+            i += 1;
         }
         i += 1;
     }
