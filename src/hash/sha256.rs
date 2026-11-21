@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SHA-256, HMAC-SHA256 and the PBKDF2 variant used by RAR 5.0.
+//! SHA-256 (FIPS 180-4) and HMAC-SHA256 (RFC 2104).
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -13,15 +13,14 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-const H0: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
+const INIT: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
 
 #[derive(Clone)]
 pub struct Sha256 {
     h: [u32; 8],
-    count: u64,
-    buf: [u8; 64],
+    pending: [u8; 64],
+    pending_len: usize,
+    total: u64,
 }
 
 impl Default for Sha256 {
@@ -30,85 +29,70 @@ impl Default for Sha256 {
     }
 }
 
+fn compress(h: &mut [u32; 8], block: &[u8]) {
+    let mut w = [0u32; 64];
+    for t in 0..16 {
+        w[t] = u32::from_be_bytes(block[t * 4..t * 4 + 4].try_into().unwrap());
+    }
+    for t in 16..64 {
+        let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+        let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+        w[t] = w[t - 16].wrapping_add(s0).wrapping_add(w[t - 7]).wrapping_add(s1);
+    }
+    let mut v = *h;
+    for t in 0..64 {
+        let [a, b, c, d, e, f, g, hh] = v;
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[t]).wrapping_add(w[t]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        v = [t1.wrapping_add(t2), a, b, c, d.wrapping_add(t1), e, f, g];
+    }
+    for (x, y) in h.iter_mut().zip(v) {
+        *x = x.wrapping_add(y);
+    }
+}
+
 impl Sha256 {
     pub fn new() -> Self {
-        Sha256 { h: H0, count: 0, buf: [0; 64] }
-    }
-
-    fn transform(&mut self) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes(self.buf[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = s1.wrapping_add(w[i - 7]).wrapping_add(s0).wrapping_add(w[i - 16]);
-        }
-        let mut v = self.h;
-        for i in 0..64 {
-            let e = v[4];
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & v[5]) ^ (!e & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let a = v[0];
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & v[1]) ^ (a & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v[7] = v[6];
-            v[6] = v[5];
-            v[5] = v[4];
-            v[4] = v[3].wrapping_add(t1);
-            v[3] = v[2];
-            v[2] = v[1];
-            v[1] = v[0];
-            v[0] = t1.wrapping_add(t2);
-        }
-        for i in 0..8 {
-            self.h[i] = self.h[i].wrapping_add(v[i]);
-        }
+        Sha256 { h: INIT, pending: [0; 64], pending_len: 0, total: 0 }
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
-        let mut pos = (self.count & 0x3f) as usize;
-        self.count += data.len() as u64;
-        while !data.is_empty() {
-            let n = (64 - pos).min(data.len());
-            self.buf[pos..pos + n].copy_from_slice(&data[..n]);
-            data = &data[n..];
-            pos += n;
-            if pos == 64 {
-                pos = 0;
-                self.transform();
+        self.total += data.len() as u64;
+        if self.pending_len > 0 {
+            let take = (64 - self.pending_len).min(data.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&data[..take]);
+            self.pending_len += take;
+            data = &data[take..];
+            if self.pending_len < 64 {
+                return;
             }
+            let block = self.pending;
+            compress(&mut self.h, &block);
+            self.pending_len = 0;
         }
+        let mut blocks = data.chunks_exact(64);
+        for b in &mut blocks {
+            compress(&mut self.h, b);
+        }
+        let rest = blocks.remainder();
+        self.pending[..rest.len()].copy_from_slice(rest);
+        self.pending_len = rest.len();
     }
 
     pub fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.count.wrapping_mul(8);
-        let mut pos = (self.count & 0x3f) as usize;
-        self.buf[pos] = 0x80;
-        pos += 1;
-        if pos != 56 {
-            if pos > 56 {
-                while pos < 64 {
-                    self.buf[pos] = 0;
-                    pos += 1;
-                }
-                pos = 0;
-            }
-            if pos == 0 {
-                self.transform();
-            }
-            for x in &mut self.buf[pos..56] {
-                *x = 0;
-            }
-        }
-        self.buf[56..].copy_from_slice(&bit_len.to_be_bytes());
-        self.transform();
+        let bits = self.total.wrapping_mul(8);
+        let pad = if self.pending_len < 56 { 56 - self.pending_len } else { 120 - self.pending_len };
+        let mut tail = [0u8; 72];
+        tail[0] = 0x80;
+        tail[pad..pad + 8].copy_from_slice(&bits.to_be_bytes());
+        self.update(&tail[..pad + 8]);
         let mut out = [0u8; 32];
-        for i in 0..8 {
-            out[i * 4..i * 4 + 4].copy_from_slice(&self.h[i].to_be_bytes());
+        for (i, x) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
         }
         out
     }
@@ -120,7 +104,7 @@ impl Sha256 {
     }
 }
 
-/// HMAC-SHA256 with precomputable inner/outer key states.
+/// HMAC-SHA256 keyed once, reusable for many messages.
 #[derive(Clone)]
 pub struct HmacSha256 {
     inner: Sha256,
@@ -129,32 +113,25 @@ pub struct HmacSha256 {
 
 impl HmacSha256 {
     pub fn new(key: &[u8]) -> Self {
-        let mut k = [0u8; 64];
+        let mut block = [0u8; 64];
         if key.len() > 64 {
-            k[..32].copy_from_slice(&Sha256::digest(key));
+            block[..32].copy_from_slice(&Sha256::digest(key));
         } else {
-            k[..key.len()].copy_from_slice(key);
-        }
-        let mut ipad = [0u8; 64];
-        let mut opad = [0u8; 64];
-        for i in 0..64 {
-            ipad[i] = k[i] ^ 0x36;
-            opad[i] = k[i] ^ 0x5c;
+            block[..key.len()].copy_from_slice(key);
         }
         let mut inner = Sha256::new();
-        inner.update(&ipad);
         let mut outer = Sha256::new();
-        outer.update(&opad);
+        inner.update(&block.map(|b| b ^ 0x36));
+        outer.update(&block.map(|b| b ^ 0x5c));
         HmacSha256 { inner, outer }
     }
 
     pub fn mac(&self, data: &[u8]) -> [u8; 32] {
-        let mut i = self.inner.clone();
-        i.update(data);
-        let ih = i.finalize();
-        let mut o = self.outer.clone();
-        o.update(&ih);
-        o.finalize()
+        let mut inner = self.inner.clone();
+        inner.update(data);
+        let mut outer = self.outer.clone();
+        outer.update(&inner.finalize());
+        outer.finalize()
     }
 }
 
@@ -165,17 +142,39 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn abc() {
-        let d = Sha256::digest(b"abc");
-        assert_eq!(d[..4], [0xba, 0x78, 0x16, 0xbf]);
-        let d = Sha256::digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
-        assert_eq!(d[..4], [0x24, 0x8d, 0x6a, 0x61]);
+
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
     }
+
     #[test]
-    fn hmac() {
-        // RFC 4231 test case 2.
-        let m = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(m[..4], [0x5b, 0xdc, 0xc1, 0x46]);
+    fn sha256_vectors() {
+        assert_eq!(hex(&Sha256::digest(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(hex(&Sha256::digest(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hex(&Sha256::digest(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let mut s = Sha256::new();
+        for _ in 0..1000 {
+            s.update(&[b'a'; 1000]);
+        }
+        assert_eq!(hex(&s.finalize()), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    }
+
+    #[test]
+    fn hmac_rfc4231() {
+        assert_eq!(
+            hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex(&hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 }
