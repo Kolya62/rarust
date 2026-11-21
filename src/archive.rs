@@ -19,7 +19,6 @@ use crate::unpack::Unpack;
 
 pub const MAX_HEADER_SIZE_RAR5: usize = 0x200000;
 const MAXSFXSIZE: usize = 0x400000;
-const MAXPATHSIZE: usize = 0x10000;
 const UNPACK_MAX_DICT: u64 = 0x1000000000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -561,9 +560,11 @@ impl Archive {
     }
 
     fn read_header15(&mut self) -> usize {
+        use crate::rar4hdr::{self as h4, Cursor};
         let mut raw = RawRead::new();
         let decrypt = self.encrypted && self.cur_block_pos > (self.sfx_size + SIZEOF_MARKHEAD3) as i64;
         if decrypt {
+            // Encrypted headers are preceded by their salt.
             self.request_arc_password();
             let mut salt = [0u8; SIZE_SALT30];
             if self.read(&mut salt) != SIZE_SALT30 as i32 {
@@ -578,266 +579,238 @@ impl Archive {
             self.unexp_end_arc_msg();
             return 0;
         }
-        let mut sb = BaseBlock { head_crc: raw.get2() as u32, ..Default::default() };
-        let header_type = raw.get1() as u32;
-        sb.flags = raw.get2() as u32;
-        sb.skip_if_unknown = sb.flags & SKIP_IF_UNKNOWN != 0;
-        sb.head_size = raw.get2() as u32;
-        sb.header_type = header_type;
-        if (sb.head_size as usize) < SIZEOF_SHORTBLOCKHEAD {
-            self.short_block = sb;
-            self.broken_header_msg();
-            return 0;
-        }
-        sb.header_type = match sb.header_type {
+        let mut c = Cursor::new(raw.data(), 0);
+        let head_crc = c.u16() as u32;
+        let raw_type = c.u8() as u32;
+        let flags = c.u16() as u32;
+        let head_size = c.u16() as u32;
+        let header_type = match raw_type {
             HEAD3_MAIN => HEAD_MAIN,
             HEAD3_FILE => HEAD_FILE,
             HEAD3_SERVICE => HEAD_SERVICE,
             HEAD3_ENDARC => HEAD_ENDARC,
             t => t,
         };
-        self.cur_header_type = sb.header_type;
-        if sb.header_type == HEAD3_CMT {
-            self.raw_read(&mut raw, SIZEOF_COMMHEAD - SIZEOF_SHORTBLOCKHEAD, decrypt);
-        } else if sb.header_type == HEAD_MAIN && (sb.flags & MHD_COMMENT) != 0 {
-            self.raw_read(&mut raw, SIZEOF_MAINHEAD3 - SIZEOF_SHORTBLOCKHEAD, decrypt);
-        } else {
-            self.raw_read(&mut raw, sb.head_size as usize - SIZEOF_SHORTBLOCKHEAD, decrypt);
+        let sb = BaseBlock {
+            head_crc,
+            header_type,
+            flags,
+            skip_if_unknown: flags & SKIP_IF_UNKNOWN != 0,
+            head_size,
+            ..Default::default()
+        };
+        if (head_size as usize) < SIZEOF_SHORTBLOCKHEAD {
+            self.short_block = BaseBlock { header_type: raw_type, ..sb };
+            self.broken_header_msg();
+            return 0;
         }
+        self.cur_header_type = header_type;
+        // Comment and main headers with an embedded comment are read only
+        // up to the end of their fixed part.
+        let rest = if header_type == HEAD3_CMT {
+            SIZEOF_COMMHEAD
+        } else if header_type == HEAD_MAIN && flags & MHD_COMMENT != 0 {
+            SIZEOF_MAINHEAD3
+        } else {
+            head_size as usize
+        } - SIZEOF_SHORTBLOCKHEAD;
+        self.raw_read(&mut raw, rest, decrypt);
         self.short_block = sb.clone();
-        self.next_block_pos = self.cur_block_pos + self.full_header_size(sb.head_size as usize) as i64;
+        self.next_block_pos = self.cur_block_pos + self.full_header_size(head_size as usize) as i64;
+        let data = raw.data().to_vec();
+        let mut c = Cursor::new(&data, SIZEOF_SHORTBLOCKHEAD);
 
-        match sb.header_type {
+        match header_type {
             HEAD_MAIN => {
-                self.main_head = MainHeader { base: sb.clone(), ..Default::default() };
-                self.main_head.high_pos_av = raw.get2();
-                self.main_head.pos_av = raw.get4();
-                let f = sb.flags;
-                self.volume = f & MHD_VOLUME != 0;
-                self.solid = f & MHD_SOLID != 0;
-                self.locked = f & MHD_LOCK != 0;
-                self.protected = f & MHD_PROTECT != 0;
-                self.encrypted = f & MHD_PASSWORD != 0;
-                self.signed = self.main_head.pos_av != 0 || self.main_head.high_pos_av != 0;
-                self.main_head.comment_in_header = f & MHD_COMMENT != 0;
-                self.first_volume = f & MHD_FIRSTVOLUME != 0;
-                self.new_numbering = f & MHD_NEWNUMBERING != 0;
+                let mut mh = MainHeader { base: sb.clone(), ..Default::default() };
+                mh.high_pos_av = c.u16();
+                mh.pos_av = c.u32();
+                mh.comment_in_header = flags & MHD_COMMENT != 0;
+                self.signed = mh.pos_av != 0 || mh.high_pos_av != 0;
+                self.main_head = mh;
+                self.volume = flags & MHD_VOLUME != 0;
+                self.solid = flags & MHD_SOLID != 0;
+                self.locked = flags & MHD_LOCK != 0;
+                self.protected = flags & MHD_PROTECT != 0;
+                self.encrypted = flags & MHD_PASSWORD != 0;
+                self.first_volume = flags & MHD_FIRSTVOLUME != 0;
+                self.new_numbering = flags & MHD_NEWNUMBERING != 0;
             }
             HEAD_FILE | HEAD_SERVICE => {
-                let file_block = sb.header_type == HEAD_FILE;
-                let mut hd = if file_block { &self.file_head } else { &self.sub_head }.reset_copy(sb.clone());
-                let f = sb.flags;
-                hd.split_before = f & LHD_SPLIT_BEFORE != 0;
-                hd.split_after = f & LHD_SPLIT_AFTER != 0;
-                hd.encrypted = f & LHD_PASSWORD != 0;
-                hd.salt_set = f & LHD_SALT != 0;
-                hd.solid = file_block && f & LHD_SOLID != 0;
-                hd.sub_block = !file_block && f & LHD_SOLID != 0;
-                hd.dir = f & LHD_WINDOWMASK == LHD_DIRECTORY;
-                hd.win_size = if hd.dir { 0 } else { 0x10000u64 << ((f & LHD_WINDOWMASK) >> 5) };
-                hd.comment_in_header = f & LHD_COMMENT != 0;
-                hd.version = f & LHD_VERSION != 0;
-                hd.data_size = raw.get4();
-                let low_unp_size = raw.get4();
-                hd.host_os = raw.get1();
+                let is_file = header_type == HEAD_FILE;
+                let f = h4::parse_file(&data, flags, head_size as usize, !is_file);
+                let mut hd = if is_file { &self.file_head } else { &self.sub_head }.reset_copy(sb.clone());
+                hd.split_before = flags & h4::F_SPLIT_BEFORE != 0;
+                hd.split_after = flags & h4::F_SPLIT_AFTER != 0;
+                hd.encrypted = flags & h4::F_PASSWORD != 0;
+                hd.salt_set = flags & h4::F_SALT != 0;
+                hd.solid = is_file && flags & h4::F_SOLID != 0;
+                hd.sub_block = !is_file && flags & h4::F_SOLID != 0;
+                hd.dir = flags & h4::F_DICT_MASK == h4::F_DIRECTORY;
+                hd.win_size = if hd.dir { 0 } else { 0x10000u64 << ((flags & h4::F_DICT_MASK) >> 5) };
+                hd.comment_in_header = flags & h4::F_COMMENT != 0;
+                hd.version = flags & h4::F_VERSION != 0;
+                hd.data_size = f.pack_low;
+                hd.host_os = f.host_os;
                 hd.file_hash.kind = HashType::Crc32;
-                hd.file_hash.crc32 = raw.get4();
-                let file_time = raw.get4();
-                hd.unp_ver = raw.get1() as u32;
-                hd.method = (raw.get1() as u32).wrapping_sub(0x30);
-                let name_size = raw.get2() as usize;
-                hd.file_attr = raw.get4();
-                if hd.unp_ver < 20 && (hd.file_attr & 0x10) != 0 {
+                hd.file_hash.crc32 = f.crc32;
+                hd.unp_ver = f.unp_ver as u32;
+                hd.method = (f.method as u32).wrapping_sub(0x30);
+                hd.file_attr = f.attr;
+                // Before RAR 2.0 the directory flag was only an attribute.
+                if hd.unp_ver < 20 && hd.file_attr & 0x10 != 0 {
                     hd.dir = true;
                 }
-                hd.crypt_method = CryptMethod::None;
-                if hd.encrypted {
-                    hd.crypt_method = match hd.unp_ver {
+                hd.crypt_method = if !hd.encrypted {
+                    CryptMethod::None
+                } else {
+                    match hd.unp_ver {
                         13 => CryptMethod::Rar13,
                         15 => CryptMethod::Rar15,
                         20 | 26 => CryptMethod::Rar20,
                         _ => CryptMethod::Rar30,
-                    };
-                }
-                hd.hs_type = HostSystemType::Unknown;
-                if hd.host_os == HOST_UNIX || hd.host_os == HOST_BEOS {
-                    hd.hs_type = HostSystemType::Unix;
+                    }
+                };
+                hd.hs_type = if hd.host_os == HOST_UNIX || hd.host_os == HOST_BEOS {
+                    HostSystemType::Unix
                 } else if hd.host_os < HOST_MAX {
-                    hd.hs_type = HostSystemType::Windows;
-                }
+                    HostSystemType::Windows
+                } else {
+                    HostSystemType::Unknown
+                };
                 hd.redir_type = FsRedir::None;
-                if hd.host_os == HOST_UNIX && (hd.file_attr & 0xF000) == 0xA000 {
+                if hd.host_os == HOST_UNIX && hd.file_attr & 0xf000 == 0xa000 {
                     hd.redir_type = FsRedir::UnixSymlink;
                     hd.redir_name.clear();
                 }
-                hd.inherited = !file_block && (hd.file_attr & SUBHEAD_FLAGS_INHERITED) != 0;
-                hd.large_file = f & LHD_LARGE != 0;
-                let (high_pack, high_unp);
-                if hd.large_file {
-                    high_pack = raw.get4();
-                    high_unp = raw.get4();
-                    hd.unknown_unp_size = low_unp_size == 0xffffffff && high_unp == 0xffffffff;
-                } else {
-                    high_pack = 0;
-                    high_unp = 0;
-                    hd.unknown_unp_size = low_unp_size == 0xffffffff;
-                }
-                hd.pack_size = ((high_pack as u64) << 32 | hd.data_size as u64) as i64;
-                hd.unp_size = ((high_unp as u64) << 32 | low_unp_size as u64) as i64;
-                if hd.unknown_unp_size {
-                    hd.unp_size = INT64NDF;
-                }
-                let read_name_size = name_size.min(MAXPATHSIZE);
-                let file_name = raw.getb_vec(read_name_size);
-                if file_block {
+                hd.inherited = !is_file && hd.file_attr & SUBHEAD_FLAGS_INHERITED != 0;
+                hd.large_file = flags & h4::F_LARGE != 0;
+                hd.unknown_unp_size = f.unp_low == u32::MAX && (!hd.large_file || f.unp_high == u32::MAX);
+                hd.pack_size = ((f.pack_high as u64) << 32 | f.pack_low as u64) as i64;
+                hd.unp_size = if hd.unknown_unp_size { INT64NDF } else { ((f.unp_high as u64) << 32 | f.unp_low as u64) as i64 };
+                if is_file {
                     hd.file_name.clear();
-                    if f & LHD_UNICODE != 0 {
-                        let length = file_name.iter().position(|&b| b == 0).unwrap_or(file_name.len()) + 1;
-                        if read_name_size > length {
-                            hd.file_name = crate::encname::decode(&file_name, &file_name[length..]);
+                    // Unicode names follow the OEM name and a zero byte.
+                    if flags & h4::F_UNICODE != 0 {
+                        let oem_len = f.name.iter().position(|&b| b == 0).unwrap_or(f.name.len()) + 1;
+                        if f.name.len() > oem_len {
+                            hd.file_name = crate::encname::decode(&f.name, &f.name[oem_len..]);
                         }
                     }
                     if hd.file_name.is_empty() {
-                        hd.file_name = oem_to_wide(&file_name);
+                        hd.file_name = oem_to_wide(&f.name);
                     }
                     self.convert_name_case(&mut hd.file_name);
                     self.convert_file_header(&mut hd);
                 } else {
-                    hd.file_name = char_to_wide(&file_name);
-                    let mut data_size = hd.base.head_size as i64 - name_size as i64 - SIZEOF_FILEHEAD3 as i64;
-                    if f & LHD_SALT != 0 {
-                        data_size -= SIZE_SALT30 as i64;
-                    }
-                    if data_size > 0 {
-                        hd.sub_data = raw.getb_vec(data_size as usize);
+                    hd.file_name = char_to_wide(&f.name);
+                    if !f.sub_data.is_empty() {
+                        hd.sub_data = f.sub_data.clone();
                     }
                     if hd.cmp_name(SUBHEAD_TYPE_CMT) {
                         self.main_comment = true;
                     }
                 }
-                if f & LHD_SALT != 0 {
-                    raw.getb(&mut hd.salt[..SIZE_SALT30]);
+                if let Some(s) = f.salt {
+                    hd.salt[..SIZE_SALT30].copy_from_slice(&s);
                 }
-                hd.mtime.set_dos(file_time);
-                if f & LHD_EXTTIME != 0 {
-                    // Extended times are always stored in file header times.
-                    if file_block {
+                hd.mtime.set_dos(f.dos_time);
+                if let Some(times) = f.ext_times {
+                    // Extended times are kept in the file header times,
+                    // also when they come with a service header.
+                    if is_file {
                         self.file_head.mtime = hd.mtime;
                         self.file_head.ctime = Default::default();
                         self.file_head.atime = Default::default();
                     }
-                    let flags = raw.get2() as u32;
-                    for i in 0..4 {
-                        let rmode = flags >> ((3 - i) * 4);
-                        if rmode & 8 == 0 || i == 3 {
-                            continue;
-                        }
-                        let cur_time = match i {
+                    for (i, t) in times.iter().enumerate() {
+                        let Some(t) = t else { continue };
+                        let cur = match i {
                             0 => &mut self.file_head.mtime,
                             1 => &mut self.file_head.ctime,
                             _ => &mut self.file_head.atime,
                         };
-                        if i != 0 {
-                            let dos = raw.get4();
-                            cur_time.set_dos(dos);
+                        if let Some(dos) = t.dos {
+                            cur.set_dos(dos);
                         }
-                        let mut rlt = cur_time.get_local();
-                        if rmode & 4 != 0 {
-                            rlt.second += 1;
+                        let mut lt = cur.get_local();
+                        if t.add_second {
+                            lt.second += 1;
                         }
-                        rlt.reminder = 0;
-                        let count = rmode & 3;
-                        for j in 0..count {
-                            let b = raw.get1() as u32;
-                            rlt.reminder |= b << ((j + 3 - count) * 8);
-                        }
-                        rlt.reminder *= crate::timefn::REMINDER_PRECISION / 10_000_000;
-                        cur_time.set_local(&rlt);
+                        lt.reminder = t.fraction * (crate::timefn::REMINDER_PRECISION / 10_000_000);
+                        cur.set_local(&lt);
                     }
-                    if file_block {
+                    if is_file {
                         hd.mtime = self.file_head.mtime;
                         hd.ctime = self.file_head.ctime;
                         hd.atime = self.file_head.atime;
                     }
                 }
                 self.next_block_pos = safe_add(self.next_block_pos, hd.pack_size, 0);
-                let crc_processed_only = hd.comment_in_header;
-                let header_crc = raw.get_crc15(crc_processed_only);
-                if hd.base.head_crc != header_crc {
+                // With an embedded comment the CRC covers only the parsed fields.
+                let end = if hd.comment_in_header { f.parsed_end } else { data.len() };
+                if hd.base.head_crc != h4::crc16_of(&data, end) {
                     self.broken_header = true;
                     set_error_code(RARX_WARNING);
                     if !decrypt {
                         ui_msg(UiMsg::FHeaderBroken(self.file_name().to_string(), hd.file_name.clone()));
                     }
                 }
-                if file_block {
+                if is_file {
                     self.file_head = hd;
                 } else {
                     self.sub_head = hd;
                 }
             }
             HEAD_ENDARC => {
-                let f = sb.flags;
+                let e = h4::parse_end(&data, flags);
                 self.end_arc_head = EndArcHeader {
                     base: sb.clone(),
-                    next_volume: f & EARC_NEXT_VOLUME != 0,
-                    data_crc: f & EARC_DATACRC != 0,
-                    rev_space: f & EARC_REVSPACE != 0,
-                    store_vol_number: f & EARC_VOLNUMBER != 0,
-                    ..Default::default()
+                    next_volume: flags & h4::END_NEXT_VOLUME != 0,
+                    data_crc: e.data_crc.is_some(),
+                    rev_space: flags & h4::END_REV_SPACE != 0,
+                    store_vol_number: e.vol_number.is_some(),
+                    arc_data_crc: e.data_crc.unwrap_or(0),
+                    vol_number: e.vol_number.unwrap_or(0) as u32,
                 };
-                if self.end_arc_head.data_crc {
-                    self.end_arc_head.arc_data_crc = raw.get4();
-                }
-                if self.end_arc_head.store_vol_number {
-                    let v = raw.get2() as u32;
-                    self.end_arc_head.vol_number = v;
-                    self.vol_number = v;
+                if let Some(v) = e.vol_number {
+                    self.vol_number = v as u32;
                 }
             }
             HEAD3_CMT => {
-                self.comm_head = CommentHeader {
-                    base: sb.clone(),
-                    unp_size: raw.get2(),
-                    unp_ver: raw.get1(),
-                    method: raw.get1(),
-                    comm_crc: raw.get2(),
-                };
+                self.comm_head =
+                    CommentHeader { base: sb.clone(), unp_size: c.u16(), unp_ver: c.u8(), method: c.u8(), comm_crc: c.u16() };
             }
             HEAD3_PROTECT => {
                 let mut ph = ProtectHeader { base: sb.clone(), ..Default::default() };
-                ph.data_size = raw.get4();
-                ph.version = raw.get1();
-                ph.rec_sectors = raw.get2();
-                ph.total_blocks = raw.get4();
-                raw.getb(&mut ph.mark);
+                ph.data_size = c.u32();
+                ph.version = c.u8();
+                ph.rec_sectors = c.u16();
+                ph.total_blocks = c.u32();
+                let m = c.bytes(ph.mark.len());
+                ph.mark[..m.len()].copy_from_slice(&m);
                 self.next_block_pos += ph.data_size as i64;
                 self.protect_head = ph;
             }
             HEAD3_OLDSERVICE => {
                 let mut sbh = SubBlockHeader { base: sb.clone(), ..Default::default() };
-                sbh.data_size = raw.get4();
+                sbh.data_size = c.u32();
                 self.next_block_pos += sbh.data_size as i64;
-                sbh.sub_type = raw.get2();
-                sbh.level = raw.get1();
+                sbh.sub_type = c.u16();
+                sbh.level = c.u8();
                 match sbh.sub_type {
                     NTACL_HEAD => {
-                        self.ea_head = EaHeader {
-                            sub: sbh.clone(),
-                            unp_size: raw.get4(),
-                            unp_ver: raw.get1(),
-                            method: raw.get1(),
-                            ea_crc: raw.get4(),
-                        };
+                        self.ea_head =
+                            EaHeader { sub: sbh.clone(), unp_size: c.u32(), unp_ver: c.u8(), method: c.u8(), ea_crc: c.u32() };
                     }
                     STREAM_HEAD => {
                         let mut st = StreamHeader { sub: sbh.clone(), ..Default::default() };
-                        st.unp_size = raw.get4();
-                        st.unp_ver = raw.get1();
-                        st.method = raw.get1();
-                        st.stream_crc = raw.get4();
-                        st.stream_name_size = raw.get2().min(260);
-                        st.stream_name = raw.getb_vec(st.stream_name_size as usize);
+                        st.unp_size = c.u32();
+                        st.unp_ver = c.u8();
+                        st.method = c.u8();
+                        st.stream_crc = c.u32();
+                        st.stream_name_size = c.u16().min(260);
+                        st.stream_name = c.bytes(st.stream_name_size as usize);
                         self.stream_head = st;
                     }
                     _ => {}
@@ -845,28 +818,24 @@ impl Archive {
                 self.sub_block_head = sbh;
             }
             _ => {
-                if sb.flags & LONG_BLOCK != 0 {
-                    self.next_block_pos += raw.get4() as i64;
+                if flags & LONG_BLOCK != 0 {
+                    self.next_block_pos += c.u32() as i64;
                 }
             }
         }
 
-        let header_crc = raw.get_crc15(false);
-        if sb.head_crc != header_crc
-            && sb.header_type != HEAD3_SIGN
-            && sb.header_type != HEAD3_AV
-            && (sb.header_type != HEAD3_OLDSERVICE || self.sub_block_head.sub_type != UO_HEAD)
-        {
+        // Signature, authenticity and old Unix owner headers are not checked.
+        let unchecked = header_type == HEAD3_SIGN
+            || header_type == HEAD3_AV
+            || (header_type == HEAD3_OLDSERVICE && self.sub_block_head.sub_type == UO_HEAD);
+        if head_crc != h4::crc16_of(&data, data.len()) && !unchecked {
+            // An end header with reserved space is valid if the archive
+            // ends with its 7 zero bytes.
             let mut recovered = false;
-            if sb.header_type == HEAD_ENDARC && self.end_arc_head.rev_space {
+            if header_type == HEAD_ENDARC && self.end_arc_head.rev_space {
                 let length = self.tell();
                 self.seek(length - 7, SEEK_SET);
-                recovered = true;
-                for _ in 0..7 {
-                    if self.get_byte() != 0 {
-                        recovered = false;
-                    }
-                }
+                recovered = (0..7).map(|_| self.get_byte()).fold(true, |ok, b| ok && b == 0);
             }
             if !recovered {
                 self.broken_header = true;
@@ -1182,18 +1151,17 @@ impl Archive {
     }
 
     fn read_header14(&mut self) -> usize {
+        use crate::rar4hdr as h4;
         let mut raw = RawRead::new();
         if self.cur_block_pos <= self.sfx_size as i64 {
             self.raw_read(&mut raw, SIZEOF_MAINHEAD14, false);
+            let m = h4::parse_main14(raw.data());
             self.main_head = MainHeader::default();
-            let mut mark = [0u8; 4];
-            raw.getb(&mut mark);
-            let head_size = raw.get2() as i64;
-            if head_size < 7 {
+            if m.head_size < 7 {
                 return 0;
             }
-            let flags = raw.get1() as u32;
-            self.next_block_pos = self.cur_block_pos + head_size;
+            let flags = m.flags as u32;
+            self.next_block_pos = self.cur_block_pos + m.head_size as i64;
             self.cur_header_type = HEAD_MAIN;
             self.volume = flags & MHD_VOLUME != 0;
             self.solid = flags & MHD_SOLID != 0;
@@ -1202,22 +1170,21 @@ impl Archive {
             self.main_head.pack_comment = flags & MHD_PACK_COMMENT != 0;
         } else {
             self.raw_read(&mut raw, SIZEOF_FILEHEAD14, false);
+            let f = h4::parse_file14(raw.data());
             let mut fh = self.file_head.reset_copy(BaseBlock::default());
             fh.base.header_type = HEAD_FILE;
-            fh.data_size = raw.get4();
-            fh.unp_size = raw.get4() as i64;
+            fh.data_size = f.pack_size;
+            fh.unp_size = f.unp_size as i64;
             fh.file_hash.kind = HashType::Rar14;
-            fh.file_hash.crc32 = raw.get2() as u32;
-            fh.base.head_size = raw.get2() as u32;
-            if fh.base.head_size < 21 {
+            fh.file_hash.crc32 = f.checksum as u32;
+            fh.base.head_size = f.head_size as u32;
+            if f.head_size < 21 {
                 return 0;
             }
-            let file_time = raw.get4();
-            fh.file_attr = raw.get1() as u32;
-            fh.base.flags = raw.get1() as u32 | LONG_BLOCK;
-            fh.unp_ver = if raw.get1() == 2 { 13 } else { 10 };
-            let name_size = raw.get1() as usize;
-            fh.method = raw.get1() as u32;
+            fh.file_attr = f.attr as u32;
+            fh.base.flags = f.flags as u32 | LONG_BLOCK;
+            fh.unp_ver = if f.version == 2 { 13 } else { 10 };
+            fh.method = f.method as u32;
             fh.split_before = fh.base.flags & LHD_SPLIT_BEFORE != 0;
             fh.split_after = fh.base.flags & LHD_SPLIT_AFTER != 0;
             fh.encrypted = fh.base.flags & LHD_PASSWORD != 0;
@@ -1227,10 +1194,11 @@ impl Archive {
             fh.dir = fh.file_attr & 0x10 != 0;
             fh.host_os = HOST_MSDOS;
             fh.hs_type = HostSystemType::Windows;
-            fh.mtime.set_dos(file_time);
+            fh.mtime.set_dos(f.dos_time);
+            let name_size = f.name_size as usize;
             self.raw_read(&mut raw, name_size, false);
-            let name = raw.getb_vec(name_size);
-            fh.file_name = oem_to_wide(&name);
+            let name = &raw.data()[SIZEOF_FILEHEAD14.min(raw.size())..];
+            fh.file_name = oem_to_wide(&name[..name_size.min(name.len())]);
             self.convert_name_case(&mut fh.file_name);
             self.convert_file_header(&mut fh);
             if raw.size() != 0 {

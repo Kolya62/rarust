@@ -211,9 +211,10 @@ src/
 ├── main.rs, lib.rs      Точка входа командной строки
 ├── cmddata.rs           Разбор командной строки и ключей
 ├── archive.rs           Заголовки архивов (RAR 1.4, 1.5–4.x, 5.0)
+├── rar4hdr.rs           Разбор заголовков RAR 1.4 и 1.5–4.x
 ├── rar5hdr.rs           Разбор заголовков RAR 5.0
 ├── extract.rs, list.rs  Команды распаковки, проверки и листинга
-├── unpack/              Распаковщики: v15, v20, v30 (+ RarVM, PPMd), rar5
+├── unpack/              Распаковщики: rar15, rar2, rar3 (+ PPMd), rar5
 ├── crypt/               Шифры RAR 1.3–3.x, AES
 ├── hash/                CRC32, BLAKE2sp, SHA-1, SHA-256, HMAC, PBKDF2
 ├── recvol.rs            Тома восстановления (Рид-Соломон, 8 и 16 бит)
