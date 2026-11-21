@@ -24,7 +24,7 @@
 
 use super::bitstream::StreamBits;
 use super::huffman::{BitSource, Huffman};
-use super::ppmd::{ByteReader, ModelPPM};
+use super::ppm::{ByteReader, Ppm};
 use super::{Unpack, UnpackIo};
 use crate::hash::crc32::crc32;
 
@@ -176,7 +176,7 @@ pub(super) struct Rar3 {
     prev_lengths: [u8; TABLES],
     tables_read: bool,
     ppm_mode: bool,
-    ppm: Box<ModelPPM>,
+    ppm: Box<Ppm>,
     esc: i32,
     recent: [usize; 4],
     last_len: u32,
@@ -226,7 +226,7 @@ impl Unpack {
         let mut inp = std::mem::take(&mut self.stream);
         inp.reset();
         if !solid {
-            let ppm = std::mem::replace(&mut st.ppm, Box::default());
+            let ppm = std::mem::take(&mut st.ppm);
             // The PPMd model survives: a non-solid file starts it anew
             // with its own parameters.
             *st = Rar3 { ppm, ..Rar3::default() };

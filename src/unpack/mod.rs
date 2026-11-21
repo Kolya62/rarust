@@ -2,7 +2,7 @@
 
 //! Decompression of RAR 1.5, 2.x, 3.x, 5.0 and 7.0 data.
 
-mod ppmd;
+mod ppm;
 mod v15;
 mod bitstream;
 mod huffman;
