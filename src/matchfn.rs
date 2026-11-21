@@ -1,8 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Wildcard matching of file names.
+//! Matching of file names against masks given on the command line.
+//!
+//! `*` matches any sequence and `?` any single character, with the
+//! traditional DOS/Windows rules for dots: "*.*" matches names without an
+//! extension, "name." matches "name", and "*." matches names without a
+//! dot. Comparison ignores case except on Unix.
+//!
+//! The mode says how the path part of a mask is used:
+//!
+//! - `MATCH_NAMES`: only name parts are compared
+//! - `MATCH_SUBPATHONLY`: the mask is a path prefix of the name
+//! - `MATCH_EXACT`, `MATCH_EXACTPATH`: paths are equal; names are equal
+//!   (`EXACT`) or match (`EXACTPATH`)
+//! - `MATCH_ALLWILD`: whole strings match
+//! - `MATCH_SUBPATH`: like `NAMES` below the mask's path
+//! - `MATCH_WILDSUBPATH`: like `SUBPATH` for masks with wildcards, else
+//!   paths are equal
+//!
+//! Except for `SUBPATHONLY`, `EXACT`, `EXACTPATH` and `ALLWILD`, a mask
+//! also matches everything inside a directory with the mask's name.
 
-use crate::pathfn::{at, chars, get_name_pos_c};
+use crate::pathfn::get_name_pos_c;
 use crate::strfn::toupperw;
 
 pub const MATCH_NAMES: u32 = 0;
@@ -15,142 +34,125 @@ pub const MATCH_WILDSUBPATH: u32 = 6;
 pub const MATCH_MODEMASK: u32 = 0x0000ffff;
 pub const MATCH_FORCECASESENSITIVE: u32 = 0x80000000;
 
-fn upc(c: char, force: bool) -> char {
-    if force || cfg!(unix) {
-        c
-    } else {
-        toupperw(c)
-    }
+#[derive(Clone, Copy)]
+struct Case {
+    sensitive: bool,
 }
 
-fn mwcsicompc(a: &[char], b: &[char], force: bool) -> bool {
-    if force || cfg!(unix) {
-        a == b
-    } else {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| toupperw(*x) == toupperw(*y))
-    }
-}
-
-fn mwcsnicompc(a: &[char], b: &[char], n: usize, force: bool) -> bool {
-    for i in 0..n {
-        let x = at(a, i);
-        let y = at(b, i);
-        let eq = if force || cfg!(unix) { x == y } else { toupperw(x) == toupperw(y) };
-        if !eq {
-            return false;
+impl Case {
+    fn fold(self, c: char) -> char {
+        if self.sensitive {
+            c
+        } else {
+            toupperw(c)
         }
-        if x == '\0' {
+    }
+
+    fn eq(self, a: char, b: char) -> bool {
+        self.fold(a) == self.fold(b)
+    }
+
+    fn eq_str(self, a: &[char], b: &[char]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| self.eq(x, y))
+    }
+
+    /// `name` starts with `prefix`.
+    fn starts_with(self, name: &[char], prefix: &[char]) -> bool {
+        name.len() >= prefix.len() && self.eq_str(&name[..prefix.len()], prefix)
+    }
+}
+
+fn has_wildcards(s: &[char]) -> bool {
+    s.iter().any(|&c| c == '*' || c == '?')
+}
+
+pub fn cmp_name(mask: &str, name: &str, mode: u32) -> bool {
+    let m: Vec<char> = mask.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    cmp_name_c(&m, &n, mode)
+}
+
+pub fn cmp_name_c(mask: &[char], name: &[char], mode: u32) -> bool {
+    let case = Case { sensitive: mode & MATCH_FORCECASESENSITIVE != 0 || cfg!(unix) };
+    let mode = mode & MATCH_MODEMASK;
+    let mpos = get_name_pos_c(mask);
+    let npos = get_name_pos_c(name);
+    let same_path = || mpos == npos && case.eq_str(&mask[..mpos], &name[..mpos]);
+
+    if mode != MATCH_NAMES {
+        // The mask names a directory containing `name`, or `name` itself.
+        if !matches!(mode, MATCH_EXACT | MATCH_EXACTPATH | MATCH_ALLWILD)
+            && case.starts_with(name, mask)
+            && matches!(name.get(mask.len()), None | Some('\\') | Some('/'))
+        {
             return true;
         }
-    }
-    true
-}
-
-fn is_wildcard_n(s: &[char], n: usize) -> bool {
-    s.iter().take(n).any(|&c| c == '*' || c == '?')
-}
-
-pub fn cmp_name(wildcard: &str, name: &str, cmp_mode: u32) -> bool {
-    let w = chars(wildcard);
-    let n = chars(name);
-    cmp_name_c(&w, &n, cmp_mode)
-}
-
-pub fn cmp_name_c(w: &[char], n: &[char], cmp_mode: u32) -> bool {
-    let force = cmp_mode & MATCH_FORCECASESENSITIVE != 0;
-    let mode = cmp_mode & MATCH_MODEMASK;
-    let p1 = get_name_pos_c(w);
-    let p2 = get_name_pos_c(n);
-    if mode != MATCH_NAMES {
-        let wl = w.len();
-        if mode != MATCH_EXACT && mode != MATCH_EXACTPATH && mode != MATCH_ALLWILD && mwcsnicompc(w, n, wl, force) {
-            let next = at(n, wl);
-            if next == '\\' || next == '/' || next == '\0' {
-                return true;
-            }
-        }
-        if mode == MATCH_SUBPATHONLY {
-            return false;
-        }
-        if (mode == MATCH_EXACT || mode == MATCH_EXACTPATH) && (p1 != p2 || !mwcsnicompc(w, n, p1, force)) {
-            return false;
-        }
-        if mode == MATCH_ALLWILD {
-            return do_match(w, n, force);
-        }
-        if mode == MATCH_SUBPATH || mode == MATCH_WILDSUBPATH {
-            if is_wildcard_n(w, p1) {
-                return do_match(w, n, force);
-            } else if mode == MATCH_SUBPATH || w.iter().any(|&c| c == '*' || c == '?') {
-                if p1 > 0 && !mwcsnicompc(w, n, p1, force) {
+        match mode {
+            MATCH_SUBPATHONLY => return false,
+            MATCH_EXACT | MATCH_EXACTPATH if !same_path() => return false,
+            MATCH_ALLWILD => return wild(mask, name, case),
+            MATCH_SUBPATH | MATCH_WILDSUBPATH => {
+                if has_wildcards(&mask[..mpos]) {
+                    return wild(mask, name, case);
+                }
+                if mode == MATCH_SUBPATH || has_wildcards(mask) {
+                    // The mask's path must be a prefix of the name's path.
+                    if mpos > 0 && !case.starts_with(name, &mask[..mpos]) {
+                        return false;
+                    }
+                } else if !same_path() {
                     return false;
                 }
-            } else if p1 != p2 || !mwcsnicompc(w, n, p1, force) {
-                return false;
             }
+            _ => {}
         }
     }
     if mode == MATCH_EXACT {
-        return mwcsicompc(&w[p1..], &n[p2..], force);
+        return case.eq_str(&mask[mpos..], &name[npos..]);
     }
-    do_match(&w[p1..], &n[p2..], force)
+    wild(&mask[mpos..], &name[npos..], case)
 }
 
-fn do_match(pattern: &[char], string: &[char], force: bool) -> bool {
-    let mut pi = 0;
-    let mut si = 0;
-    loop {
-        let sc = upc(at(string, si), force);
-        let pc = upc(at(pattern, pi), force);
-        pi += 1;
-        match pc {
-            '\0' => return sc == '\0',
-            '?' => {
-                if sc == '\0' {
-                    return false;
-                }
-            }
-            '*' => {
-                if at(pattern, pi) == '\0' {
-                    return true;
-                }
-                if at(pattern, pi) == '.' {
-                    if at(pattern, pi + 1) == '*' && at(pattern, pi + 2) == '\0' {
-                        return true;
-                    }
-                    let dot = string[si.min(string.len())..].iter().position(|&c| c == '.').map(|p| p + si);
-                    if at(pattern, pi + 1) == '\0' {
-                        return dot.is_none() || at(string, dot.unwrap() + 1) == '\0';
-                    }
-                    if let Some(d) = dot {
-                        si = d;
-                        let pat_rest = &pattern[pi.min(pattern.len())..];
-                        if !pat_rest.iter().any(|&c| c == '*' || c == '?')
-                            && !string[(si + 1).min(string.len())..].contains(&'.')
-                        {
-                            return mwcsicompc(&pattern[(pi + 1).min(pattern.len())..], &string[(si + 1).min(string.len())..], force);
-                        }
-                    }
-                }
-                while si < string.len() {
-                    if do_match(&pattern[pi.min(pattern.len())..], &string[si..], force) {
-                        return true;
-                    }
-                    si += 1;
-                }
-                return false;
-            }
-            _ => {
-                if pc != sc {
-                    if pc == '.' && (sc == '\0' || sc == '\\' || sc == '.') {
-                        return do_match(&pattern[pi.min(pattern.len())..], &string[si.min(string.len())..], force);
-                    }
-                    return false;
-                }
+/// Wildcard match of a whole string.
+fn wild(p: &[char], s: &[char], case: Case) -> bool {
+    let Some((&pc, rest)) = p.split_first() else { return s.is_empty() };
+    match pc {
+        '?' => !s.is_empty() && wild(rest, &s[1..], case),
+        '*' => star(rest, s, case),
+        _ => match s.first() {
+            Some(&sc) if case.eq(pc, sc) => wild(rest, &s[1..], case),
+            // A dot in the mask may stand for a missing extension.
+            None | Some('\\') | Some('.') if pc == '.' => wild(rest, s, case),
+            _ => false,
+        },
+    }
+}
+
+/// Match of `*` followed by `rest` against `s`.
+fn star(rest: &[char], s: &[char], case: Case) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let mut from = 0;
+    if rest[0] == '.' {
+        if rest == ['.', '*'] {
+            return true;
+        }
+        let dot = s.iter().position(|&c| c == '.');
+        if rest.len() == 1 {
+            // "*." : no extension (or an empty one).
+            return dot.is_none_or(|d| d + 1 == s.len());
+        }
+        if let Some(d) = dot {
+            from = d;
+            // Fixed extension and a single dot left: compare directly.
+            if !has_wildcards(rest) && !s[d + 1..].contains(&'.') {
+                return case.eq_str(&rest[1..], &s[d + 1..]);
             }
         }
-        si += 1;
     }
+    // The star is not tried against an empty remainder.
+    (from..s.len()).any(|i| wild(rest, &s[i..], case))
 }
 
 #[cfg(test)]
