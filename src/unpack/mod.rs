@@ -3,9 +3,9 @@
 //! Decompression of RAR 1.5, 2.x, 3.x, 5.0 and 7.0 data.
 
 mod ppm;
-mod v15;
 mod bitstream;
 mod huffman;
+mod rar15;
 mod rar2;
 mod rar3;
 mod rar5;
@@ -183,6 +183,7 @@ pub struct Unpack {
 
     max_user_threads: u32,
     rar5: rar5::Rar5,
+    rar15: Box<rar15::Rar15>,
     rar2: Box<rar2::Rar2>,
     rar3: Box<rar3::Rar3>,
     stream: bitstream::StreamBits,
@@ -291,6 +292,7 @@ impl Unpack {
             tables_read2: false,
             max_user_threads: 1,
             rar5: rar5::Rar5::default(),
+            rar15: Box::default(),
             rar2: Box::default(),
             rar3: Box::default(),
             stream: bitstream::StreamBits::default(),
@@ -299,8 +301,6 @@ impl Unpack {
             max_win_mask: 0,
         };
         u.unp_init_data(false);
-        u.unp_init_data15(false);
-        u.init_huff();
         u
     }
 
@@ -352,7 +352,7 @@ impl Unpack {
             return;
         }
         match method {
-            15 => self.unpack15(solid, io),
+            15 => self.unpack_rar15(solid, io),
             20 | 26 => self.unpack_rar2(solid, io),
             29 => self.unpack_rar3(solid, io),
             50 | 70 => {
@@ -482,7 +482,6 @@ impl Unpack {
     /// Prepares the shared LZ window for a file of the RAR 1.5-2.x decoders.
     fn lz_start(&mut self, solid: bool) {
         self.unp_init_data(solid);
-        self.unp_init_data15(solid);
     }
 
     /// Remembers that the window position wrapped around, after which
