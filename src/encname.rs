@@ -1,87 +1,66 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Decoder of RAR 2.x/3.x Unicode file names.
+//! Unicode file names of RAR 2.x-4.x. The header stores an 8-bit name, a
+//! zero byte and a compact encoding of the UTF-16 name that refers back
+//! to the 8-bit name:
+//!
+//! ```text
+//! high   u8   default high byte
+//! then groups of a flag byte and up to four items, two flag bits each:
+//!   0  low byte, high byte 0
+//!   1  low byte, default high byte
+//!   2  low byte, high byte
+//!   3  run: n u8; if n & 0x80: correction u8 and (n & 0x7f) + 2
+//!      characters made of (8-bit name byte + correction) and the default
+//!      high byte; otherwise n + 2 characters copied from the 8-bit name
+//! ```
 
 pub fn decode(name: &[u8], enc: &[u8]) -> String {
-    let mut out: Vec<u32> = Vec::new();
-    let mut enc_pos = 0;
-    let mut dec_pos = 0;
-    let mut flags: u32 = 0;
-    let mut flag_bits = 0;
-    let high_byte = if enc_pos < enc.len() {
-        enc_pos += 1;
-        enc[0] as u32
-    } else {
-        0
+    let mut units: Vec<u16> = Vec::with_capacity(name.len());
+    let Some((&high, mut rest)) = enc.split_first() else { return String::new() };
+    let high = (high as u16) << 8;
+    let next = |rest: &mut &[u8]| -> Option<u8> {
+        let (&b, r) = rest.split_first()?;
+        *rest = r;
+        Some(b)
     };
-    let set = |out: &mut Vec<u32>, pos: usize, v: u32| {
-        if out.len() <= pos {
-            out.resize(pos + 1, 0);
-        }
-        out[pos] = v;
-    };
-    while enc_pos < enc.len() {
-        if flag_bits == 0 {
-            flags = enc[enc_pos] as u32;
-            enc_pos += 1;
-            flag_bits = 8;
-        }
-        match (flags >> 6) & 3 {
-            0 => {
-                if enc_pos < enc.len() {
-                    set(&mut out, dec_pos, enc[enc_pos] as u32);
-                    dec_pos += 1;
-                    enc_pos += 1;
-                }
+    'outer: while let Some(flags) = next(&mut rest) {
+        for shift in [6, 4, 2, 0] {
+            if rest.is_empty() {
+                break 'outer;
             }
-            1 => {
-                if enc_pos < enc.len() {
-                    set(&mut out, dec_pos, enc[enc_pos] as u32 + (high_byte << 8));
-                    dec_pos += 1;
-                    enc_pos += 1;
+            match (flags >> shift) & 3 {
+                0 => units.push(next(&mut rest).unwrap() as u16),
+                1 => units.push(next(&mut rest).unwrap() as u16 | high),
+                2 => {
+                    if rest.len() < 2 {
+                        continue;
+                    }
+                    let lo = next(&mut rest).unwrap() as u16;
+                    let hi = next(&mut rest).unwrap() as u16;
+                    units.push(lo | hi << 8);
                 }
-            }
-            2 => {
-                if enc_pos + 1 < enc.len() {
-                    set(&mut out, dec_pos, enc[enc_pos] as u32 + ((enc[enc_pos + 1] as u32) << 8));
-                    dec_pos += 1;
-                    enc_pos += 2;
-                }
-            }
-            _ => {
-                if enc_pos < enc.len() {
-                    let mut length = enc[enc_pos] as u32;
-                    enc_pos += 1;
-                    if length & 0x80 != 0 {
-                        if enc_pos < enc.len() {
-                            let correction = enc[enc_pos] as u32;
-                            enc_pos += 1;
-                            length = (length & 0x7f) + 2;
-                            while length > 0 && dec_pos < name.len() {
-                                set(&mut out, dec_pos, ((name[dec_pos] as u32 + correction) & 0xff) + (high_byte << 8));
-                                length -= 1;
-                                dec_pos += 1;
-                            }
+                _ => {
+                    let n = next(&mut rest).unwrap();
+                    if n & 0x80 != 0 {
+                        let Some(corr) = next(&mut rest) else { continue };
+                        for _ in 0..(n & 0x7f) as usize + 2 {
+                            let Some(&b) = name.get(units.len()) else { break };
+                            units.push(b.wrapping_add(corr) as u16 | high);
                         }
                     } else {
-                        length += 2;
-                        while length > 0 && dec_pos < name.len() {
-                            set(&mut out, dec_pos, name[dec_pos] as u32);
-                            length -= 1;
-                            dec_pos += 1;
+                        for _ in 0..n as usize + 2 {
+                            let Some(&b) = name.get(units.len()) else { break };
+                            units.push(b as u16);
                         }
                     }
                 }
             }
         }
-        flags = (flags << 2) & 0xff;
-        flag_bits -= 2;
     }
-    // Values are UTF-16 code units.
-    let units: Vec<u16> = out.iter().map(|&u| u as u16).collect();
     let mut s = String::from_utf16_lossy(&units);
-    if let Some(p) = s.find('\0') {
-        s.truncate(p);
+    if let Some(z) = s.find('\0') {
+        s.truncate(z);
     }
     s
 }

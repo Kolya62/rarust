@@ -16,43 +16,30 @@ fn cut_zero(src: &[u8]) -> &[u8] {
     }
 }
 
-/// Decode UTF-8 bytes. Stops at first zero or invalid sequence.
+/// Decodes UTF-8 bytes up to the first zero byte. Decoding stops at a
+/// malformed sequence; code points above U+10FFFF are skipped and
+/// surrogates become U+FFFD.
 pub fn utf_to_wide(src: &[u8]) -> String {
     let src = cut_zero(src);
-    let mut out = String::new();
+    let mut out = String::with_capacity(src.len());
     let mut i = 0;
-    let at = |i: usize| src.get(i).copied().unwrap_or(0) as u32;
     while i < src.len() {
-        let c = src[i] as u32;
-        i += 1;
-        let d;
-        if c < 0x80 {
-            d = c;
-        } else if (c >> 5) == 6 {
-            if (at(i) & 0xc0) != 0x80 {
-                break;
-            }
-            d = ((c & 0x1f) << 6) | (at(i) & 0x3f);
-            i += 1;
-        } else if (c >> 4) == 14 {
-            if (at(i) & 0xc0) != 0x80 || (at(i + 1) & 0xc0) != 0x80 {
-                break;
-            }
-            d = ((c & 0xf) << 12) | ((at(i) & 0x3f) << 6) | (at(i + 1) & 0x3f);
-            i += 2;
-        } else if (c >> 3) == 30 {
-            if (at(i) & 0xc0) != 0x80 || (at(i + 1) & 0xc0) != 0x80 || (at(i + 2) & 0xc0) != 0x80 {
-                break;
-            }
-            d = ((c & 7) << 18) | ((at(i) & 0x3f) << 12) | ((at(i + 1) & 0x3f) << 6) | (at(i + 2) & 0x3f);
-            i += 3;
-        } else {
-            break;
+        let lead = src[i];
+        // Sequence length and the payload bits of the lead byte.
+        let (len, init) = match lead {
+            0x00..=0x7f => (1, lead as u32),
+            0xc0..=0xdf => (2, (lead & 0x1f) as u32),
+            0xe0..=0xef => (3, (lead & 0x0f) as u32),
+            0xf0..=0xf7 => (4, (lead & 0x07) as u32),
+            _ => break,
+        };
+        let tail = src.get(i + 1..i + len);
+        let Some(tail) = tail.filter(|t| t.iter().all(|&b| b & 0xc0 == 0x80)) else { break };
+        let cp = tail.iter().fold(init, |acc, &b| acc << 6 | (b & 0x3f) as u32);
+        i += len;
+        if cp <= 0x10ffff {
+            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
         }
-        if d > 0x10ffff {
-            continue;
-        }
-        out.push(char::from_u32(d).unwrap_or('\u{FFFD}'));
     }
     out
 }

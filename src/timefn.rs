@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! RAR time representation: nanoseconds since 01.01.1601.
+//! Time stamps: nanoseconds since 1601-01-01 UTC, the epoch of Windows
+//! FILETIME, which keeps all RAR time formats (DOS, FILETIME, Unix
+//! seconds and nanoseconds) exact.
 
 use crate::tz;
 
-const TICKS_PER_SECOND: u64 = 1_000_000_000;
-const USHIFT: u64 = 11_644_473_600_000_000_000; // ns between 1601 and 1970.
-pub const REMINDER_PRECISION: u32 = 1_000_000_000;
+const NS: u64 = 1_000_000_000;
+/// Nanoseconds from 1601-01-01 to 1970-01-01.
+const UNIX_EPOCH_NS: u64 = 11_644_473_600 * NS;
+/// Units of `RarLocalTime::reminder` per second.
+pub const REMINDER_PRECISION: u32 = NS as u32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RarTime {
-    itime: u64,
+    ns: u64,
 }
 
+/// Broken down local time. `reminder` is the fraction of the second in
+/// nanoseconds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RarLocalTime {
     pub year: u32,
@@ -28,175 +34,171 @@ pub struct RarLocalTime {
 
 impl RarTime {
     pub fn reset(&mut self) {
-        self.itime = 0;
+        self.ns = 0;
     }
+
+    /// Zero means "not set".
     pub fn is_set(&self) -> bool {
-        self.itime != 0
+        self.ns != 0
     }
+
+    /// Windows FILETIME: 100 ns units.
     pub fn get_win(&self) -> u64 {
-        self.itime / (TICKS_PER_SECOND / 10_000_000)
+        self.ns / 100
     }
     pub fn set_win(&mut self, t: u64) {
-        self.itime = t.wrapping_mul(TICKS_PER_SECOND / 10_000_000);
+        self.ns = t.wrapping_mul(100);
     }
-    pub fn get_unix(&self) -> i64 {
-        (self.get_unix_ns() / 1_000_000_000) as i64
-    }
-    pub fn set_unix(&mut self, ut: i64) {
-        self.set_unix_ns((ut as u64).wrapping_mul(1_000_000_000));
-    }
+
     pub fn get_unix_ns(&self) -> u64 {
-        self.itime.wrapping_mul(1_000_000_000 / TICKS_PER_SECOND).wrapping_sub(USHIFT)
+        self.ns.wrapping_sub(UNIX_EPOCH_NS)
     }
     pub fn set_unix_ns(&mut self, ns: u64) {
-        self.itime = ns.wrapping_add(USHIFT) / (1_000_000_000 / TICKS_PER_SECOND);
+        self.ns = ns.wrapping_add(UNIX_EPOCH_NS);
     }
+    pub fn get_unix(&self) -> i64 {
+        (self.get_unix_ns() / NS) as i64
+    }
+    pub fn set_unix(&mut self, secs: i64) {
+        self.set_unix_ns((secs as u64).wrapping_mul(NS));
+    }
+
+    /// Adds `ns` nanoseconds.
     pub fn adjust(&mut self, ns: i64) {
-        self.itime = self.itime.wrapping_add(ns as u64);
+        self.ns = self.ns.wrapping_add(ns as u64);
     }
 
     pub fn get_local(&self) -> RarLocalTime {
-        let ut = self.get_unix_ns() as i64;
-        let ut = ut.div_euclid(1_000_000_000);
-        let lt = ut + tz::local_offset(ut);
-        let days = lt.div_euclid(86400);
-        let secs = lt.rem_euclid(86400);
-        let (y, m, d) = tz::civil_from_days(days);
-        let jan1 = tz::timegm(y, 1, 1, 0, 0, 0).div_euclid(86400);
+        let secs = (self.get_unix_ns() as i64).div_euclid(NS as i64);
+        let local = secs + tz::local_offset(secs);
+        let days = local.div_euclid(86400);
+        let in_day = local.rem_euclid(86400) as u32;
+        let (year, month, day) = tz::civil_from_days(days);
+        let year_start = tz::timegm(year, 1, 1, 0, 0, 0).div_euclid(86400);
         RarLocalTime {
-            year: y as u32,
-            month: m,
-            day: d,
-            hour: (secs / 3600) as u32,
-            minute: (secs / 60 % 60) as u32,
-            second: (secs % 60) as u32,
-            reminder: (self.itime % TICKS_PER_SECOND) as u32,
+            year: year as u32,
+            month,
+            day,
+            hour: in_day / 3600,
+            minute: in_day / 60 % 60,
+            second: in_day % 60,
+            reminder: (self.ns % NS) as u32,
+            // 1970-01-01 was a Thursday.
             wday: (days + 4).rem_euclid(7) as u32,
-            yday: (days - jan1) as u32,
+            yday: (days - year_start) as u32,
         }
     }
 
     pub fn set_local(&mut self, lt: &RarLocalTime) {
-        let t = tz::mktime(
-            lt.year as i64,
-            lt.month,
-            lt.day,
-            lt.hour as i64,
-            lt.minute as i64,
-            lt.second as i64,
-        );
-        self.set_unix(t);
-        self.itime = self.itime.wrapping_add(lt.reminder as u64);
+        let secs = tz::mktime(lt.year as i64, lt.month, lt.day, lt.hour as i64, lt.minute as i64, lt.second as i64);
+        self.set_unix(secs);
+        self.ns = self.ns.wrapping_add(lt.reminder as u64);
     }
 
+    /// MS-DOS date and time in local time, 2 second precision:
+    /// bits 0-4 seconds / 2, 5-10 minutes, 11-15 hours, 16-20 day,
+    /// 21-24 month, 25-31 years since 1980.
     pub fn get_dos(&self) -> u32 {
-        let lt = self.get_local();
-        (lt.second / 2) | (lt.minute << 5) | (lt.hour << 11) | (lt.day << 16) | (lt.month << 21) | ((lt.year.wrapping_sub(1980)) << 25)
+        let t = self.get_local();
+        t.second / 2 | t.minute << 5 | t.hour << 11 | t.day << 16 | t.month << 21 | t.year.wrapping_sub(1980) << 25
     }
 
     pub fn set_dos(&mut self, dos: u32) {
-        let lt = RarLocalTime {
-            second: (dos & 0x1f) * 2,
-            minute: (dos >> 5) & 0x3f,
-            hour: (dos >> 11) & 0x1f,
-            day: (dos >> 16) & 0x1f,
-            month: (dos >> 21) & 0x0f,
-            year: (dos >> 25) + 1980,
+        let field = |shift: u32, bits: u32| (dos >> shift) & ((1 << bits) - 1);
+        self.set_local(&RarLocalTime {
+            second: field(0, 5) * 2,
+            minute: field(5, 6),
+            hour: field(11, 5),
+            day: field(16, 5),
+            month: field(21, 4),
+            year: field(25, 7) + 1980,
             ..Default::default()
-        };
-        self.set_local(&lt);
+        });
     }
 
-    pub fn get_text(&self, full_ms: bool) -> String {
-        if self.is_set() {
-            let lt = self.get_local();
-            if full_ms {
-                crate::wfmt!(
-                    "%u-%02u-%02u %02u:%02u:%02u,%09u",
-                    lt.year,
-                    lt.month,
-                    lt.day,
-                    lt.hour,
-                    lt.minute,
-                    lt.second,
-                    lt.reminder
-                )
-            } else {
-                crate::wfmt!("%u-%02u-%02u %02u:%02u", lt.year, lt.month, lt.day, lt.hour, lt.minute)
-            }
+    /// "YYYY-MM-DD HH:MM", or with seconds and nanoseconds.
+    pub fn get_text(&self, full: bool) -> String {
+        if !self.is_set() {
+            return "????-??-?? ??:??".to_string();
+        }
+        let t = self.get_local();
+        let base = format!("{}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute);
+        if full {
+            format!("{base}:{:02},{:09}", t.second, t.reminder)
         } else {
-            "????-??-?? ??:??".to_string()
+            base
         }
     }
 
+    /// Parses "YYYY[MM[DD[HH[MM[SS]]]]]" in local time; separators
+    /// between digits are ignored and missing month or day mean 1.
     pub fn set_iso_text(&mut self, text: &str) {
-        let mut field = [0i64; 6];
-        let mut digits = 0usize;
-        for c in text.chars() {
-            if c.is_ascii_digit() {
-                let pos = if digits < 4 { 0 } else { (digits - 4) / 2 + 1 };
-                if pos < 6 {
-                    field[pos] = field[pos] * 10 + (c as i64 - '0' as i64);
-                }
-                digits += 1;
+        let digits: Vec<i64> = text.chars().filter_map(|c| c.to_digit(10)).map(i64::from).collect();
+        // Field lengths: year 4, then 2 each.
+        let mut f = [0i64; 6];
+        for (n, d) in digits.iter().enumerate() {
+            let i = if n < 4 { 0 } else { (n - 4) / 2 + 1 };
+            if i < 6 {
+                f[i] = f[i] * 10 + d;
             }
         }
-        let lt = RarLocalTime {
-            second: field[5] as u32,
-            minute: field[4] as u32,
-            hour: field[3] as u32,
-            day: if field[2] == 0 { 1 } else { field[2] as u32 },
-            month: if field[1] == 0 { 1 } else { field[1] as u32 },
-            year: field[0] as u32,
+        let one_if_zero = |v: i64| if v == 0 { 1 } else { v as u32 };
+        self.set_local(&RarLocalTime {
+            year: f[0] as u32,
+            month: one_if_zero(f[1]),
+            day: one_if_zero(f[2]),
+            hour: f[3] as u32,
+            minute: f[4] as u32,
+            second: f[5] as u32,
             ..Default::default()
-        };
-        self.set_local(&lt);
+        });
     }
 
+    /// Current time minus an age like "1d2h30m", "45s".
     pub fn set_age_text(&mut self, text: &str) {
-        let mut seconds: u64 = 0;
-        let mut value: u64 = 0;
+        let mut total = 0u64;
+        let mut n = 0u64;
         for c in text.chars() {
             if let Some(d) = c.to_digit(10) {
-                value = value * 10 + d as u64;
-            } else {
-                match c.to_ascii_uppercase() {
-                    'D' => seconds += value * 24 * 3600,
-                    'H' => seconds += value * 3600,
-                    'M' => seconds += value * 60,
-                    'S' => seconds += value,
-                    _ => {}
-                }
-                value = 0;
+                n = n * 10 + d as u64;
+                continue;
             }
+            total += n * match c.to_ascii_uppercase() {
+                'D' => 86400,
+                'H' => 3600,
+                'M' => 60,
+                'S' => 1,
+                _ => 0,
+            };
+            n = 0;
         }
         self.set_current_time();
-        self.itime = self.itime.wrapping_sub(seconds * TICKS_PER_SECOND);
+        self.ns = self.ns.wrapping_sub(total * NS);
     }
 
+    /// Current time, whole seconds.
     pub fn set_current_time(&mut self) {
-        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-        self.set_unix(d.as_secs() as i64);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        self.set_unix(now.as_secs() as i64);
     }
 
     pub fn from_system_time(t: std::time::SystemTime) -> RarTime {
         let mut r = RarTime::default();
-        match t.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => r.set_unix_ns(d.as_secs().wrapping_mul(1_000_000_000).wrapping_add(d.subsec_nanos() as u64)),
-            Err(e) => {
-                let d = e.duration();
-                r.set_unix_ns((d.as_nanos() as u64).wrapping_neg());
-            }
-        }
+        let ns = match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as u64,
+            Err(e) => (e.duration().as_nanos() as u64).wrapping_neg(),
+        };
+        r.set_unix_ns(ns);
         r
     }
 
     pub fn to_system_time(&self) -> std::time::SystemTime {
         let ns = self.get_unix_ns() as i64;
+        let d = std::time::Duration::from_nanos(ns.unsigned_abs());
         if ns >= 0 {
-            std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns as u64)
+            std::time::UNIX_EPOCH + d
         } else {
-            std::time::UNIX_EPOCH - std::time::Duration::from_nanos(ns.unsigned_abs())
+            std::time::UNIX_EPOCH - d
         }
     }
 }
