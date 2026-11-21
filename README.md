@@ -213,7 +213,7 @@ src/
 ├── unpack/              Decompressors: rar15, rar2, rar3 (+ PPMd), rar5
 ├── crypt/               RAR 1.3–3.x ciphers, AES
 ├── hash/                CRC32, BLAKE2sp, SHA-1, SHA-256, HMAC, PBKDF2
-├── recvol.rs            Recovery volumes (Reed-Solomon 8 and 16 bit)
+├── recvol/              Recovery volumes (Reed-Solomon 8 and 16 bit)
 ├── volume.rs            Multivolume archives
 ├── extinfo.rs, motw.rs  Links, owners, ACLs, streams, Mark of the Web
 ├── tz.rs, timefn.rs     Time zones (TZif, POSIX TZ rules) and time formats

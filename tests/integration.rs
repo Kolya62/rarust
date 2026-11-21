@@ -168,3 +168,40 @@ fn ppmd_model_restart() {
     assert!(std::fs::read(d.join("ppm_bin.dat")).unwrap() == ppmd_binary(30000));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Rebuilds all data volumes from recovery volumes and compares them with
+/// the originals: both RAR 5.0 volumes from its two .rev files, and each
+/// RAR 3.x volume from its single .rev file.
+#[test]
+fn recovery_volume_rebuild_all() {
+    let cases: [(&str, &[&str], &str); 3] = [
+        ("g5_vol.", &["g5_vol.part01.rar", "g5_vol.part02.rar"], "g5_vol.part01.rev"),
+        ("g4_vol.", &["g4_vol.part01.rar"], "g4_vol.part01.rev"),
+        ("g4_vol.", &["g4_vol.part02.rar"], "g4_vol.part01.rev"),
+    ];
+    for (i, (prefix, removed, rev)) in cases.iter().enumerate() {
+        let d = tmp_dir(&format!("rebuild{i}"));
+        for e in std::fs::read_dir(data()).unwrap() {
+            let n = e.unwrap().file_name().to_string_lossy().into_owned();
+            if n.starts_with(prefix) {
+                std::fs::copy(data().join(&n), d.join(&n)).unwrap();
+            }
+        }
+        for r in *removed {
+            std::fs::remove_file(d.join(r)).unwrap();
+        }
+        let rev = d.join(rev).to_string_lossy().into_owned();
+        let ok = std::thread::spawn(move || {
+            let cmd = std::rc::Rc::new(std::cell::RefCell::new(rarust::cmddata::CommandData::new()));
+            cmd.borrow_mut().disable_percentage = true;
+            rarust::recvol::rec_volumes_restore(&cmd, &rev, true)
+        })
+        .join()
+        .unwrap();
+        assert!(ok, "{removed:?}");
+        for r in *removed {
+            assert!(std::fs::read(d.join(r)).unwrap() == std::fs::read(data().join(r)).unwrap(), "{r}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
