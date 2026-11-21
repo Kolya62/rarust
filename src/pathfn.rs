@@ -46,7 +46,7 @@ pub fn get_name_pos_c(p: &[char]) -> usize {
 
 /// Byte index of the name part.
 pub fn get_name_pos(path: &str) -> usize {
-    match path.char_indices().filter(|&(_, c)| is_path_div(c)).last() {
+    match path.char_indices().rfind(|&(_, c)| is_path_div(c)) {
         Some((i, c)) => i + c.len_utf8(),
         None if is_drive_letter(path) => path.char_indices().nth(2).map_or(path.len(), |(i, _)| i),
         None => 0,
