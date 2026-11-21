@@ -6,11 +6,11 @@ use crate::cmddata::{CmdRef, QOpenMode, NAMES_LOWERCASE, NAMES_UPPERCASE};
 use crate::crypt::*;
 use crate::errhnd::{self, *};
 use crate::file::{File, SEEK_END, SEEK_SET};
-use crate::hash::sha256::Sha256;
 use crate::hash::HashType;
 use crate::headers::*;
 use crate::pathfn::CPATHDIVIDER;
 use crate::rawread::RawRead;
+use crate::timefn::RarTime;
 use crate::rdwrfn::{ComprDataIO, DataIoCtx};
 use crate::strfn::{wcslower, wcsupper};
 use crate::ui::{ui_msg, UiMsg};
@@ -882,81 +882,88 @@ impl Archive {
         raw.size()
     }
 
-    fn read_header50(&mut self) -> usize {
-        let mut raw = RawRead::new();
-        let decrypt = self.encrypted && self.cur_block_pos > (self.sfx_size + SIZEOF_MARKHEAD5) as i64;
-        if decrypt {
-            if self.cmd.borrow().skip_encrypted {
-                ui_msg(UiMsg::SkipEncArc(self.file_name().to_string()));
+    /// Reads the password check data preceding an encrypted RAR 5.0 header
+    /// and sets the header decryption key. Returns false if headers cannot
+    /// be decrypted.
+    fn start_header_decryption50(&mut self) -> bool {
+        if self.cmd.borrow().skip_encrypted {
+            ui_msg(UiMsg::SkipEncArc(self.file_name().to_string()));
+            self.failed_header_decryption = true;
+            return false;
+        }
+        let mut iv = [0u8; SIZE_INITV];
+        if self.read(&mut iv) != SIZE_INITV as i32 {
+            self.unexp_end_arc_msg();
+            return false;
+        }
+        let fixed_password = self.cmd.borrow().password_set();
+        let verify = self.crypt_head.use_psw_check && !self.broken_header;
+        loop {
+            self.request_arc_password();
+            let pwd = self.password();
+            let ch = self.crypt_head.clone();
+            let keys = self.headers_crypt.set_keys(CryptMethod::Rar50, &pwd, Some(&ch.salt), Some(&iv), ch.lg2_count);
+            let wrong = verify && keys.is_some_and(|k| k.psw_check != ch.psw_check);
+            if !wrong {
+                return true;
+            }
+            let n = self.file_name().to_string();
+            if fixed_password {
+                ui_msg(UiMsg::BadPsw(n.clone(), n));
                 self.failed_header_decryption = true;
-                return 0;
+                set_error_code(RARX_BADPWD);
+                return false;
             }
-            let mut init_v = [0u8; SIZE_INITV];
-            if self.read(&mut init_v) != SIZE_INITV as i32 {
-                self.unexp_end_arc_msg();
-                return 0;
-            }
-            let global_password = self.cmd.borrow().password_set();
-            let use_check = self.crypt_head.use_psw_check && !self.broken_header;
-            loop {
-                self.request_arc_password();
-                let pwd = self.password();
-                let ch = self.crypt_head.clone();
-                let keys = self.headers_crypt.set_keys(CryptMethod::Rar50, &pwd, Some(&ch.salt), Some(&init_v), ch.lg2_count);
-                if let Some(k) = keys {
-                    if use_check && k.psw_check != ch.psw_check {
-                        let n = self.file_name().to_string();
-                        if global_password {
-                            ui_msg(UiMsg::BadPsw(n.clone(), n));
-                            self.failed_header_decryption = true;
-                            set_error_code(RARX_BADPWD);
-                            return 0;
-                        } else {
-                            ui_msg(UiMsg::WaitBadPsw(n.clone(), n));
-                            self.cmd.borrow_mut().password_clean();
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
+            ui_msg(UiMsg::WaitBadPsw(n.clone(), n));
+            self.cmd.borrow_mut().password_clean();
         }
-        const FIRST_READ_SIZE: usize = 7;
-        if self.raw_read(&mut raw, FIRST_READ_SIZE, decrypt) < FIRST_READ_SIZE {
+    }
+
+    fn read_header50(&mut self) -> usize {
+        use crate::rar5hdr::{self as h5, Block, Time};
+        let decrypt = self.encrypted && self.cur_block_pos > (self.sfx_size + SIZEOF_MARKHEAD5) as i64;
+        if decrypt && !self.start_header_decryption50() {
+            return 0;
+        }
+        // CRC32 and a size vint of up to 3 bytes come first.
+        let mut raw = RawRead::new();
+        const PROBE: usize = 7;
+        if self.raw_read(&mut raw, PROBE, decrypt) < PROBE {
             self.unexp_end_arc_msg();
             return 0;
         }
-        let mut sb = BaseBlock { head_crc: raw.get4(), ..Default::default() };
-        let size_bytes = raw.get_vsize(4);
-        let block_size = raw.getv();
-        if block_size == 0 || size_bytes == 0 {
-            self.short_block = sb;
+        let stored_crc = u32::from_le_bytes(raw.data()[..4].try_into().unwrap());
+        let Some((body_size, size_len)) = h5::header_size(&raw.data()[4..]).filter(|&(s, _)| s != 0) else {
+            self.short_block = BaseBlock { head_crc: stored_crc, ..Default::default() };
+            self.broken_header_msg();
+            return 0;
+        };
+        let total = 4 + size_len as u64 + body_size;
+        if total < SIZEOF_SHORTBLOCKHEAD5 as u64 || body_size > MAX_HEADER_SIZE_RAR5 as u64 {
+            self.short_block = BaseBlock { head_crc: stored_crc, ..Default::default() };
             self.broken_header_msg();
             return 0;
         }
-        let size_to_read = block_size as i64 - (FIRST_READ_SIZE as i64 - size_bytes as i64 - 4);
-        let header_size = 4 + size_bytes as u64 + block_size;
-        if size_to_read < 0 || header_size < SIZEOF_SHORTBLOCKHEAD5 as u64 || block_size > MAX_HEADER_SIZE_RAR5 as u64 {
-            self.short_block = sb;
-            self.broken_header_msg();
-            return 0;
+        let total = total as usize;
+        if total > PROBE {
+            self.raw_read(&mut raw, total - PROBE, decrypt);
         }
-        self.raw_read(&mut raw, size_to_read as usize, decrypt);
-        if (raw.size() as u64) < header_size {
+        if raw.size() < total {
             self.unexp_end_arc_msg();
             return 0;
         }
-        let header_crc = raw.get_crc50();
-        let ht = raw.getv();
-        sb.header_type = ht.min(HEAD_UNKNOWN as u64) as u32;
-        sb.flags = raw.getv() as u32;
-        sb.skip_if_unknown = sb.flags & HFL_SKIPIFUNKNOWN != 0;
-        sb.head_size = header_size as u32;
+        let (common, block) = h5::parse(&raw.data()[..total]);
+
+        let sb = BaseBlock {
+            head_crc: stored_crc,
+            header_type: common.kind.min(HEAD_UNKNOWN as u64) as u32,
+            flags: common.flags as u32,
+            skip_if_unknown: common.flags & h5::HF_SKIP_IF_UNKNOWN != 0,
+            head_size: total as u32,
+        };
         self.cur_header_type = sb.header_type;
         self.short_block = sb.clone();
-
-        let bad_crc = sb.head_crc != header_crc;
-        if bad_crc {
+        if !common.crc_ok {
             self.broken_header_msg();
             self.broken_header = true;
             set_error_code(RARX_CRC);
@@ -967,357 +974,157 @@ impl Archive {
                 return 0;
             }
         }
-        let mut extra_size: u64 = 0;
-        if sb.flags & HFL_EXTRA != 0 {
-            extra_size = raw.getv();
-            if extra_size >= sb.head_size as u64 {
-                self.broken_header_msg();
-                return 0;
-            }
+        if common.flags & h5::HF_EXTRA != 0 && common.extra_size >= total as u64 {
+            self.broken_header_msg();
+            return 0;
         }
-        let mut data_size: u64 = 0;
-        if sb.flags & HFL_DATA != 0 {
-            data_size = raw.getv();
-        }
-        self.next_block_pos = self.cur_block_pos + self.full_header_size(sb.head_size as usize) as i64;
-        self.next_block_pos = safe_add(self.next_block_pos, data_size as i64, 0);
+        self.next_block_pos = self.cur_block_pos + self.full_header_size(total) as i64;
+        self.next_block_pos = safe_add(self.next_block_pos, common.data_size as i64, 0);
 
-        match sb.header_type {
-            HEAD_CRYPT => {
-                let mut ch = CryptHeader { base: sb.clone(), ..Default::default() };
-                let crypt_version = raw.getv() as u32 as u64;
-                if crypt_version > CRYPT_VERSION {
+        let set_time = |t: &mut RarTime, v: Time| match v {
+            Time::Unix(s) => t.set_unix(s as i64),
+            Time::UnixNs(ns) => t.set_unix_ns(ns),
+            Time::Windows(w) => t.set_win(w),
+        };
+
+        match block {
+            Block::Crypt(c) => {
+                if c.version > CRYPT_VERSION {
                     let n = self.file_name().to_string();
-                    self.unk_enc_ver_msg(&n, &format!("h{}", crypt_version));
+                    self.unk_enc_ver_msg(&n, &format!("h{}", c.version));
                     self.failed_header_decryption = true;
                     return 0;
                 }
-                let enc_flags = raw.getv() as u32;
-                ch.use_psw_check = enc_flags & CHFL_CRYPT_PSWCHECK != 0;
-                ch.lg2_count = raw.get1() as u32;
-                if ch.lg2_count > CRYPT5_KDF_LG2_COUNT_MAX {
+                if c.kdf_lg2 as u32 > CRYPT5_KDF_LG2_COUNT_MAX {
                     let n = self.file_name().to_string();
-                    self.unk_enc_ver_msg(&n, &format!("hc{}", ch.lg2_count));
+                    self.unk_enc_ver_msg(&n, &format!("hc{}", c.kdf_lg2));
                     self.failed_header_decryption = true;
                     return 0;
                 }
-                raw.getb(&mut ch.salt);
-                if ch.use_psw_check {
-                    raw.getb(&mut ch.psw_check);
-                    let mut csum = [0u8; SIZE_PSWCHECK_CSUM];
-                    raw.getb(&mut csum);
-                    let digest = Sha256::digest(&ch.psw_check);
-                    ch.use_psw_check = csum == digest[..SIZE_PSWCHECK_CSUM];
-                }
-                self.crypt_head = ch;
+                self.crypt_head = CryptHeader {
+                    base: sb,
+                    use_psw_check: c.check.is_some(),
+                    lg2_count: c.kdf_lg2 as u32,
+                    salt: c.salt,
+                    psw_check: c.check.unwrap_or_default(),
+                };
                 self.encrypted = true;
             }
-            HEAD_MAIN => {
-                self.main_head = MainHeader { base: sb.clone(), ..Default::default() };
-                let arc_flags = raw.getv() as u32;
-                self.volume = arc_flags & MHFL_VOLUME != 0;
-                self.solid = arc_flags & MHFL_SOLID != 0;
-                self.locked = arc_flags & MHFL_LOCK != 0;
-                self.protected = arc_flags & MHFL_PROTECT != 0;
+            Block::Main(m) => {
+                let mut mh = MainHeader { base: sb, ..Default::default() };
+                if let Some(l) = &m.locator {
+                    let at = self.cur_block_pos as u64;
+                    mh.locator = true;
+                    mh.qopen_offset = l.quick_open.map_or(0, |o| o.wrapping_add(at));
+                    mh.rr_offset = l.recovery.map_or(0, |o| o.wrapping_add(at));
+                }
+                if let Some(n) = &m.orig_name {
+                    mh.orig_name = utf_to_wide(n);
+                }
+                if let Some(t) = m.orig_time {
+                    set_time(&mut mh.orig_time, t);
+                }
+                self.main_head = mh;
+                self.volume = m.volume;
+                self.solid = m.solid;
+                self.locked = m.locked;
+                self.protected = m.recovery;
                 self.signed = false;
                 self.new_numbering = true;
-                self.vol_number = if arc_flags & MHFL_VOLNUMBER != 0 { raw.getv() as u32 } else { 0 };
+                self.vol_number = m.volume_number.unwrap_or(0) as u32;
                 self.first_volume = self.volume && self.vol_number == 0;
-                if extra_size != 0 {
-                    self.process_extra50_main(&mut raw, extra_size as usize);
-                }
-                if !self.prohibit_qopen
-                    && self.main_head.locator
-                    && self.main_head.qopen_offset > 0
-                    && self.cmd.borrow().qopen_mode != QOpenMode::None
-                {
-                    let save_cur = self.cur_block_pos;
-                    let save_next = self.next_block_pos;
-                    let save_type = self.cur_header_type;
+                let qopen = self.main_head.qopen_offset;
+                if !self.prohibit_qopen && qopen > 0 && self.cmd.borrow().qopen_mode != QOpenMode::None {
+                    let saved = (self.cur_block_pos, self.next_block_pos, self.cur_header_type);
                     self.qopen = QuickOpen::default();
-                    let off = self.main_head.qopen_offset;
-                    self.qo_load(off);
-                    self.cur_block_pos = save_cur;
-                    self.next_block_pos = save_next;
-                    self.cur_header_type = save_type;
+                    self.qo_load(qopen);
+                    (self.cur_block_pos, self.next_block_pos, self.cur_header_type) = saved;
                 }
             }
-            HEAD_FILE | HEAD_SERVICE => {
-                let file_block = sb.header_type == HEAD_FILE;
-                let mut hd = if file_block { &self.file_head } else { &self.sub_head }.reset_copy(sb.clone());
+            Block::File(f) | Block::Service(f) => {
+                let is_file = common.kind == h5::BLOCK_FILE;
+                let mut hd = if is_file { &self.file_head } else { &self.sub_head }.reset_copy(sb);
+                let comp = h5::Compression::decode(f.comp);
                 hd.large_file = true;
-                hd.pack_size = data_size as i64;
-                hd.file_flags = raw.getv() as u32;
-                hd.unp_size = raw.getv() as i64;
-                hd.unknown_unp_size = hd.file_flags & FHFL_UNPUNKNOWN != 0;
-                if hd.unknown_unp_size {
-                    hd.unp_size = INT64NDF;
-                }
+                hd.pack_size = common.data_size as i64;
+                hd.unknown_unp_size = f.unp_size.is_none();
+                hd.unp_size = f.unp_size.map_or(INT64NDF, |s| s as i64);
                 hd.max_size = hd.pack_size.max(hd.unp_size);
-                hd.file_attr = raw.getv() as u32;
-                if hd.file_flags & FHFL_UTIME != 0 {
-                    let t = raw.get4();
+                hd.file_attr = f.attr as u32;
+                if let Some(t) = f.mtime {
                     hd.mtime.set_unix(t as i64);
                 }
                 hd.file_hash.kind = HashType::None;
-                if hd.file_flags & FHFL_CRC32 != 0 {
+                if let Some(crc) = f.crc32 {
                     hd.file_hash.kind = HashType::Crc32;
-                    hd.file_hash.crc32 = raw.get4();
+                    hd.file_hash.crc32 = crc;
                 }
                 hd.redir_type = FsRedir::None;
-                let comp_info = raw.getv() as u32;
-                hd.method = (comp_info >> 7) & 7;
-                let unp_ver = comp_info & 0x3f;
-                hd.unp_ver = match unp_ver {
+                hd.method = comp.method as u32;
+                hd.unp_ver = match comp.algorithm {
                     0 => VER_PACK5,
+                    1 if comp.v5_compatible => VER_PACK5,
                     1 => VER_PACK7,
                     _ => VER_UNKNOWN,
                 };
-                hd.host_os = raw.getv() as u8;
-                let name_size = raw.getv() as usize;
-                hd.inherited = sb.flags & HFL_INHERITED != 0;
+                hd.host_os = f.host_os as u8;
                 hd.hs_type = match hd.host_os {
                     HOST5_UNIX => HostSystemType::Unix,
                     HOST5_WINDOWS => HostSystemType::Windows,
                     _ => HostSystemType::Unknown,
                 };
-                hd.split_before = sb.flags & HFL_SPLITBEFORE != 0;
-                hd.split_after = sb.flags & HFL_SPLITAFTER != 0;
-                hd.sub_block = sb.flags & HFL_CHILD != 0;
-                hd.solid = file_block && comp_info & FCI_SOLID != 0;
-                hd.dir = hd.file_flags & FHFL_DIRECTORY != 0;
-                if hd.dir || unp_ver > 1 {
-                    hd.win_size = 0;
-                } else {
-                    hd.win_size = 0x20000u64 << ((comp_info >> 10) & if unp_ver == 0 { 0x0f } else { 0x1f });
-                    if unp_ver == 1 {
-                        hd.win_size += hd.win_size / 32 * ((comp_info >> 15) & 0x1f) as u64;
-                        if comp_info & FCI_RAR5_COMPAT != 0 {
-                            hd.unp_ver = VER_PACK5;
-                        }
-                        if hd.win_size > UNPACK_MAX_DICT {
-                            hd.unp_ver = VER_UNKNOWN;
-                        }
-                    }
+                hd.inherited = common.flags & h5::HF_INHERITED != 0;
+                hd.split_before = common.flags & h5::HF_SPLIT_BEFORE != 0;
+                hd.split_after = common.flags & h5::HF_SPLIT_AFTER != 0;
+                hd.sub_block = common.flags & h5::HF_CHILD != 0;
+                hd.solid = is_file && comp.solid;
+                hd.dir = f.dir;
+                hd.win_size = if f.dir { 0 } else { comp.dict };
+                if comp.algorithm == 1 && hd.win_size > UNPACK_MAX_DICT {
+                    hd.unp_ver = VER_UNKNOWN;
                 }
-                let read_name_size = name_size.min(MAXPATHSIZE);
-                let name = raw.getb_vec(read_name_size);
-                hd.file_name = utf_to_wide(&name);
-                if extra_size != 0 {
-                    self.process_extra50_file(&mut raw, extra_size as usize, &mut hd);
-                }
-                if file_block {
-                    self.convert_name_case(&mut hd.file_name);
-                    self.convert_file_header(&mut hd);
-                }
-                if !file_block && hd.cmp_name(SUBHEAD_TYPE_CMT) {
-                    self.main_comment = true;
-                }
-                if !file_block && hd.cmp_name(SUBHEAD_TYPE_RR) && !hd.sub_data.is_empty() {
-                    let mut rp = RawRead::new();
-                    rp.read_mem(&hd.sub_data);
-                    self.recovery_percent = rp.getv() as i32;
-                }
-                if bad_crc {
-                    ui_msg(UiMsg::FHeaderBroken(self.file_name().to_string(), hd.file_name.clone()));
-                }
-                if file_block {
-                    self.file_head = hd;
-                } else {
-                    self.sub_head = hd;
-                }
-            }
-            HEAD_ENDARC => {
-                let arc_flags = raw.getv() as u32;
-                self.end_arc_head = EndArcHeader {
-                    base: sb.clone(),
-                    next_volume: arc_flags & EHFL_NEXTVOLUME != 0,
-                    ..Default::default()
-                };
-            }
-            _ => {}
-        }
-        raw.size()
-    }
+                hd.file_name = utf_to_wide(&f.name);
 
-    /// Iterate over extra area records. Calls `f(raw, field_type, field_size, next_pos)`.
-    fn for_each_extra(raw: &mut RawRead, extra_size: usize, mut f: impl FnMut(&mut RawRead, u64, i64, usize)) {
-        let extra_start = raw.size().wrapping_sub(extra_size);
-        if extra_start < raw.get_pos() || extra_start > raw.size() {
-            return;
-        }
-        raw.set_pos(extra_start);
-        while raw.data_left() >= 2 {
-            let field_size = raw.getv() as i64;
-            if field_size <= 0 || raw.data_left() == 0 || field_size > raw.data_left() as i64 {
-                break;
-            }
-            let next_pos = raw.get_pos() + field_size as usize;
-            let field_type = raw.getv();
-            let field_size = next_pos as i64 - raw.get_pos() as i64;
-            if field_size < 0 {
-                break;
-            }
-            f(raw, field_type, field_size, next_pos);
-            raw.set_pos(next_pos);
-        }
-    }
-
-    fn process_extra50_main(&mut self, raw: &mut RawRead, extra_size: usize) {
-        let cur_block_pos = self.cur_block_pos as u64;
-        let hd = &mut self.main_head;
-        Self::for_each_extra(raw, extra_size, |raw, field_type, _fs, _np| match field_type {
-            MHEXTRA_LOCATOR => {
-                hd.locator = true;
-                let flags = raw.getv() as u32;
-                if flags & MHEXTRA_LOCATOR_QLIST != 0 {
-                    let off = raw.getv();
-                    if off != 0 {
-                        hd.qopen_offset = off.wrapping_add(cur_block_pos);
-                    }
-                }
-                if flags & MHEXTRA_LOCATOR_RR != 0 {
-                    let off = raw.getv();
-                    if off != 0 {
-                        hd.rr_offset = off.wrapping_add(cur_block_pos);
-                    }
-                }
-            }
-            MHEXTRA_METADATA => {
-                let flags = raw.getv() as u32;
-                if flags & MHEXTRA_METADATA_NAME != 0 {
-                    let name_size = raw.getv();
-                    if name_size > 0 && name_size < MAXPATHSIZE as u64 {
-                        let n = raw.getb_vec(name_size as usize);
-                        if n[0] != 0 {
-                            hd.orig_name = utf_to_wide(&n);
-                        }
-                    }
-                }
-                if flags & MHEXTRA_METADATA_CTIME != 0 {
-                    if flags & MHEXTRA_METADATA_UNIXTIME != 0 {
-                        if flags & MHEXTRA_METADATA_UNIX_NS != 0 {
-                            hd.orig_time.set_unix_ns(raw.get8());
-                        } else {
-                            hd.orig_time.set_unix(raw.get4() as i64);
-                        }
-                    } else {
-                        hd.orig_time.set_win(raw.get8());
-                    }
-                }
-            }
-            _ => {}
-        });
-    }
-
-    fn process_extra50_file(&mut self, raw: &mut RawRead, extra_size: usize, hd: &mut FileHeader) {
-        let arc_name = self.file_name().to_string();
-        let is_service = hd.base.header_type == HEAD_SERVICE;
-        Self::for_each_extra(raw, extra_size, |raw, field_type, field_size, next_pos| match field_type {
-            FHEXTRA_CRYPT => {
-                let enc_version = raw.getv() as u32 as u64;
-                if enc_version > CRYPT_VERSION {
-                    ui_msg(UiMsg::UnknownEncMethod(arc_name.clone(), hd.file_name.clone(), format!("x{}", enc_version)));
+                if let Some(info) = &f.bad_crypt {
+                    ui_msg(UiMsg::UnknownEncMethod(self.file_name().to_string(), hd.file_name.clone(), info.clone()));
                     set_error_code(RARX_FATAL);
                     hd.crypt_method = CryptMethod::Unknown;
-                } else {
-                    let flags = raw.getv() as u32;
-                    hd.lg2_count = raw.get1() as u32;
-                    if hd.lg2_count > CRYPT5_KDF_LG2_COUNT_MAX {
-                        ui_msg(UiMsg::UnknownEncMethod(arc_name.clone(), hd.file_name.clone(), format!("xc{}", hd.lg2_count)));
-                        set_error_code(RARX_FATAL);
-                        hd.crypt_method = CryptMethod::Unknown;
-                    } else {
-                        hd.use_psw_check = flags & FHEXTRA_CRYPT_PSWCHECK != 0;
-                        hd.use_hash_key = flags & FHEXTRA_CRYPT_HASHMAC != 0;
-                        raw.getb(&mut hd.salt);
-                        raw.getb(&mut hd.init_v);
-                        if hd.use_psw_check {
-                            raw.getb(&mut hd.psw_check);
-                            let mut csum = [0u8; SIZE_PSWCHECK_CSUM];
-                            raw.getb(&mut csum);
-                            let digest = Sha256::digest(&hd.psw_check);
-                            hd.use_psw_check = csum == digest[..SIZE_PSWCHECK_CSUM];
-                            if is_service && hd.psw_check == [0u8; SIZE_PSWCHECK] {
-                                hd.use_psw_check = false;
-                            }
-                        }
-                        hd.salt_set = true;
-                        hd.crypt_method = CryptMethod::Rar50;
-                        hd.encrypted = true;
-                    }
                 }
-            }
-            FHEXTRA_HASH => {
-                let t = raw.getv() as u32;
-                if t == FHEXTRA_HASH_BLAKE2 {
+                if let Some(c) = &f.crypt {
+                    hd.lg2_count = c.kdf_lg2 as u32;
+                    hd.use_psw_check = c.check.is_some();
+                    hd.psw_check = c.check.unwrap_or_default();
+                    hd.use_hash_key = c.mac;
+                    hd.salt = c.salt;
+                    hd.init_v = c.iv;
+                    hd.salt_set = true;
+                    hd.crypt_method = CryptMethod::Rar50;
+                    hd.encrypted = true;
+                }
+                if let Some(d) = f.blake2 {
                     hd.file_hash.kind = HashType::Blake2;
-                    raw.getb(&mut hd.file_hash.digest);
+                    hd.file_hash.digest = d;
                 }
-            }
-            FHEXTRA_HTIME => {
-                if field_size >= 5 {
-                    let flags = raw.getv() as u8;
-                    let unix_time = flags & FHEXTRA_HTIME_UNIXTIME != 0;
-                    if flags & FHEXTRA_HTIME_MTIME != 0 {
-                        if unix_time {
-                            hd.mtime.set_unix(raw.get4() as i64);
-                        } else {
-                            hd.mtime.set_win(raw.get8());
+                if let Some(t) = &f.times {
+                    for (dst, v, ns) in [
+                        (&mut hd.mtime, t.mtime, t.mtime_ns),
+                        (&mut hd.ctime, t.ctime, t.ctime_ns),
+                        (&mut hd.atime, t.atime, t.atime_ns),
+                    ] {
+                        if let Some(v) = v {
+                            set_time(dst, v);
                         }
-                    }
-                    if flags & FHEXTRA_HTIME_CTIME != 0 {
-                        if unix_time {
-                            hd.ctime.set_unix(raw.get4() as i64);
-                        } else {
-                            hd.ctime.set_win(raw.get8());
-                        }
-                    }
-                    if flags & FHEXTRA_HTIME_ATIME != 0 {
-                        if unix_time {
-                            hd.atime.set_unix(raw.get4() as i64);
-                        } else {
-                            hd.atime.set_win(raw.get8());
-                        }
-                    }
-                    if unix_time && flags & FHEXTRA_HTIME_UNIX_NS != 0 {
-                        if flags & FHEXTRA_HTIME_MTIME != 0 {
-                            let ns = raw.get4() & 0x3fffffff;
-                            if ns < 1_000_000_000 {
-                                hd.mtime.adjust(ns as i64);
-                            }
-                        }
-                        if flags & FHEXTRA_HTIME_CTIME != 0 {
-                            let ns = raw.get4() & 0x3fffffff;
-                            if ns < 1_000_000_000 {
-                                hd.ctime.adjust(ns as i64);
-                            }
-                        }
-                        if flags & FHEXTRA_HTIME_ATIME != 0 {
-                            let ns = raw.get4() & 0x3fffffff;
-                            if ns < 1_000_000_000 {
-                                hd.atime.adjust(ns as i64);
-                            }
+                        if let Some(ns) = ns {
+                            dst.adjust(ns as i64);
                         }
                     }
                 }
-            }
-            FHEXTRA_VERSION => {
-                if field_size >= 1 {
-                    raw.getv();
-                    let version = raw.getv() as u32;
-                    if version != 0 {
-                        hd.version = true;
-                        hd.file_name.push_str(&format!(";{}", version));
-                    }
+                if let Some(v) = f.version {
+                    hd.version = true;
+                    hd.file_name.push_str(&format!(";{v}"));
                 }
-            }
-            FHEXTRA_REDIR => {
-                let redir_type = raw.getv();
-                let flags = raw.getv() as u32;
-                let name_size = raw.getv() as usize;
-                if name_size > 0 && name_size < MAXPATHSIZE {
-                    hd.redir_type = match redir_type {
+                if let Some(r) = &f.redirect {
+                    hd.redir_type = match r.kind {
                         0 => FsRedir::None,
                         1 => FsRedir::UnixSymlink,
                         2 => FsRedir::WinSymlink,
@@ -1326,53 +1133,52 @@ impl Archive {
                         5 => FsRedir::FileCopy,
                         _ => FsRedir::Unknown,
                     };
-                    hd.dir_target = flags & FHEXTRA_REDIR_DIR != 0;
-                    let n = raw.getb_vec(name_size);
-                    hd.redir_name = utf_to_wide(&n);
+                    hd.dir_target = r.target_is_dir;
+                    hd.redir_name = utf_to_wide(&r.target);
                     if !cfg!(unix) {
                         hd.redir_name = crate::pathfn::unix_slash_to_dos(&hd.redir_name);
                     }
                 }
-            }
-            FHEXTRA_UOWNER => {
-                let flags = raw.getv() as u32;
-                hd.unix_owner_numeric = flags & FHEXTRA_UOWNER_NUMUID != 0;
-                hd.unix_group_numeric = flags & FHEXTRA_UOWNER_NUMGID != 0;
-                hd.unix_owner_name.clear();
-                hd.unix_group_name.clear();
-                if flags & FHEXTRA_UOWNER_UNAME != 0 {
-                    let l = (raw.getv() as usize).min(255);
-                    let mut v = raw.getb_vec(l);
-                    if let Some(p) = v.iter().position(|&b| b == 0) {
-                        v.truncate(p);
+                if let Some(o) = &f.owner {
+                    hd.unix_owner_name = o.user.clone().unwrap_or_default();
+                    hd.unix_group_name = o.group.clone().unwrap_or_default();
+                    hd.unix_owner_numeric = o.uid.is_some();
+                    hd.unix_group_numeric = o.gid.is_some();
+                    if let Some(id) = o.uid {
+                        hd.unix_owner_id = id as u32;
                     }
-                    hd.unix_owner_name = v;
-                }
-                if flags & FHEXTRA_UOWNER_GNAME != 0 {
-                    let l = (raw.getv() as usize).min(255);
-                    let mut v = raw.getb_vec(l);
-                    if let Some(p) = v.iter().position(|&b| b == 0) {
-                        v.truncate(p);
+                    if let Some(id) = o.gid {
+                        hd.unix_group_id = id as u32;
                     }
-                    hd.unix_group_name = v;
+                    hd.unix_owner_set = true;
                 }
-                if hd.unix_owner_numeric {
-                    hd.unix_owner_id = raw.getv() as u32;
+                if let Some(d) = f.service_data {
+                    hd.sub_data = d;
                 }
-                if hd.unix_group_numeric {
-                    hd.unix_group_id = raw.getv() as u32;
+
+                if is_file {
+                    self.convert_name_case(&mut hd.file_name);
+                    self.convert_file_header(&mut hd);
+                } else if hd.cmp_name(SUBHEAD_TYPE_CMT) {
+                    self.main_comment = true;
+                } else if hd.cmp_name(SUBHEAD_TYPE_RR) && !hd.sub_data.is_empty() {
+                    self.recovery_percent = h5::Cursor::new(&hd.sub_data).vint() as i32;
                 }
-                hd.unix_owner_set = true;
+                if !common.crc_ok {
+                    ui_msg(UiMsg::FHeaderBroken(self.file_name().to_string(), hd.file_name.clone()));
+                }
+                if is_file {
+                    self.file_head = hd;
+                } else {
+                    self.sub_head = hd;
+                }
             }
-            FHEXTRA_SUBDATA => {
-                let mut fs = field_size;
-                if is_service && raw.size() - next_pos == 1 {
-                    fs += 1;
-                }
-                hd.sub_data = raw.getb_vec(fs as usize);
+            Block::End { more_volumes } => {
+                self.end_arc_head = EndArcHeader { base: sb, next_volume: more_volumes, ..Default::default() };
             }
-            _ => {}
-        });
+            Block::Unknown => {}
+        }
+        raw.size()
     }
 
     fn read_header14(&mut self) -> usize {

@@ -126,63 +126,15 @@ pub const SUBHEAD_FLAGS_INHERITED: u32 = 0x80000000;
 pub const SUBHEAD_FLAGS_CMT_UNICODE: u32 = 0x00000001;
 
 // RAR 5.0 flags.
-pub const HFL_EXTRA: u32 = 0x0001;
-pub const HFL_DATA: u32 = 0x0002;
-pub const HFL_SKIPIFUNKNOWN: u32 = 0x0004;
-pub const HFL_SPLITBEFORE: u32 = 0x0008;
-pub const HFL_SPLITAFTER: u32 = 0x0010;
-pub const HFL_CHILD: u32 = 0x0020;
-pub const HFL_INHERITED: u32 = 0x0040;
 
-pub const MHFL_VOLUME: u32 = 0x0001;
-pub const MHFL_VOLNUMBER: u32 = 0x0002;
-pub const MHFL_SOLID: u32 = 0x0004;
-pub const MHFL_PROTECT: u32 = 0x0008;
-pub const MHFL_LOCK: u32 = 0x0010;
 
-pub const FHFL_DIRECTORY: u32 = 0x0001;
-pub const FHFL_UTIME: u32 = 0x0002;
-pub const FHFL_CRC32: u32 = 0x0004;
-pub const FHFL_UNPUNKNOWN: u32 = 0x0008;
 
-pub const EHFL_NEXTVOLUME: u32 = 0x0001;
-pub const CHFL_CRYPT_PSWCHECK: u32 = 0x0001;
 
-pub const FCI_SOLID: u32 = 0x00000040;
 pub const FCI_DICT_BIT0: u32 = 0x00000400;
 pub const FCI_DICT_FRACT0: u32 = 0x00008000;
-pub const FCI_RAR5_COMPAT: u32 = 0x00100000;
 
-pub const MHEXTRA_LOCATOR: u64 = 0x01;
-pub const MHEXTRA_METADATA: u64 = 0x02;
-pub const MHEXTRA_LOCATOR_QLIST: u32 = 0x01;
-pub const MHEXTRA_LOCATOR_RR: u32 = 0x02;
-pub const MHEXTRA_METADATA_NAME: u32 = 0x01;
-pub const MHEXTRA_METADATA_CTIME: u32 = 0x02;
-pub const MHEXTRA_METADATA_UNIXTIME: u32 = 0x04;
-pub const MHEXTRA_METADATA_UNIX_NS: u32 = 0x08;
 
-pub const FHEXTRA_CRYPT: u64 = 0x01;
-pub const FHEXTRA_HASH: u64 = 0x02;
-pub const FHEXTRA_HTIME: u64 = 0x03;
-pub const FHEXTRA_VERSION: u64 = 0x04;
-pub const FHEXTRA_REDIR: u64 = 0x05;
-pub const FHEXTRA_UOWNER: u64 = 0x06;
-pub const FHEXTRA_SUBDATA: u64 = 0x07;
 
-pub const FHEXTRA_HASH_BLAKE2: u32 = 0x00;
-pub const FHEXTRA_HTIME_UNIXTIME: u8 = 0x01;
-pub const FHEXTRA_HTIME_MTIME: u8 = 0x02;
-pub const FHEXTRA_HTIME_CTIME: u8 = 0x04;
-pub const FHEXTRA_HTIME_ATIME: u8 = 0x08;
-pub const FHEXTRA_HTIME_UNIX_NS: u8 = 0x10;
-pub const FHEXTRA_CRYPT_PSWCHECK: u32 = 0x01;
-pub const FHEXTRA_CRYPT_HASHMAC: u32 = 0x02;
-pub const FHEXTRA_REDIR_DIR: u32 = 0x01;
-pub const FHEXTRA_UOWNER_UNAME: u32 = 0x01;
-pub const FHEXTRA_UOWNER_GNAME: u32 = 0x02;
-pub const FHEXTRA_UOWNER_NUMUID: u32 = 0x04;
-pub const FHEXTRA_UOWNER_NUMGID: u32 = 0x08;
 
 /// Undefined 64-bit value marker.
 pub const INT64NDF: i64 = (0x7fffffffi64 << 32) | 0x7fffffff;

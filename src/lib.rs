@@ -30,6 +30,7 @@ pub mod matchfn;
 pub mod motw;
 pub mod parallel;
 pub mod pathfn;
+pub mod rar5hdr;
 pub mod rawread;
 pub mod rdwrfn;
 pub mod recvol;
