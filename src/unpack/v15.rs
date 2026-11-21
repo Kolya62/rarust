@@ -55,7 +55,7 @@ impl Unpack {
                 break;
             }
             if (self.wr_ptr.wrapping_sub(self.unp_ptr) & self.max_win_mask) < 270 && self.wr_ptr != self.unp_ptr {
-                self.unp_write_buf20(io);
+                self.lz_flush(io);
             }
             if self.st_mode != 0 {
                 self.huff_decode();
@@ -93,7 +93,7 @@ impl Unpack {
                 }
             }
         }
-        self.unp_write_buf20(io);
+        self.lz_flush(io);
     }
 
     fn short_lz(&mut self) {

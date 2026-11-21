@@ -19,6 +19,7 @@
 //! (257), matches with one of four recent distances (258-261) and new
 //! matches (262+).
 
+use super::huffman::{BitSource, Huffman};
 use super::UnpackIo;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,8 +37,6 @@ const REP_LEN_CODES: usize = 44;
 /// Code used to transmit the bit lengths of the other codes.
 const LEVEL_CODES: usize = 20;
 
-const MAX_CODE_LEN: u32 = 15;
-const QUICK_BITS: u32 = 10;
 
 /// The longest match: length slot 43 with all extra bits set plus three
 /// extra bytes added for long distances.
@@ -175,6 +174,17 @@ struct Bits<'a> {
     pos: u64,
 }
 
+impl BitSource for Bits<'_> {
+    #[inline(always)]
+    fn peek32(&mut self) -> u32 {
+        Bits::peek32(self)
+    }
+    #[inline(always)]
+    fn skip(&mut self, n: u32) {
+        Bits::skip(self, n)
+    }
+}
+
 impl Bits<'_> {
     #[inline(always)]
     fn peek32(&self) -> u32 {
@@ -212,110 +222,6 @@ impl Bits<'_> {
         } else {
             let hi = self.take(n - 32) as u64;
             hi << 32 | self.take(32) as u64
-        }
-    }
-}
-
-/// Canonical Huffman decoder. Shorter codes come first; codes of equal
-/// length are ordered by symbol value.
-#[derive(Clone)]
-struct Huffman {
-    /// `limit[l]`: first code of length `l + 1`, as a left aligned
-    /// 15-bit number.
-    limit: [u32; MAX_CODE_LEN as usize + 2],
-    /// `first[l]`: canonical code value of the first code of length `l`.
-    first: [u32; MAX_CODE_LEN as usize + 1],
-    /// `index[l]`: position of the first symbol of length `l` in `symbols`.
-    index: [u32; MAX_CODE_LEN as usize + 1],
-    symbols: Vec<u16>,
-    /// Indexed by the next `QUICK_BITS` bits: symbol << 4 | code length, or
-    /// 0 when the code is longer.
-    quick: Vec<u16>,
-}
-
-impl Default for Huffman {
-    fn default() -> Self {
-        Huffman {
-            limit: [0; MAX_CODE_LEN as usize + 2],
-            first: [0; MAX_CODE_LEN as usize + 1],
-            index: [0; MAX_CODE_LEN as usize + 1],
-            symbols: Vec::new(),
-            quick: vec![0; 1 << QUICK_BITS],
-        }
-    }
-}
-
-impl Huffman {
-    fn build(&mut self, lengths: &[u8]) {
-        let mut count = [0u32; MAX_CODE_LEN as usize + 1];
-        for &l in lengths {
-            count[l as usize] += 1;
-        }
-        count[0] = 0;
-        let mut code = 0u32;
-        let mut index = 0u32;
-        for l in 1..=MAX_CODE_LEN as usize {
-            self.first[l] = code;
-            self.index[l] = index;
-            code += count[l];
-            index += count[l];
-            // Saturate for oversubscribed (corrupt) codes.
-            self.limit[l] = (code << (MAX_CODE_LEN as usize - l)).min(1 << MAX_CODE_LEN);
-            code <<= 1;
-        }
-        self.limit[MAX_CODE_LEN as usize + 1] = u32::MAX;
-        self.symbols.clear();
-        self.symbols.resize(index as usize, 0);
-        let mut next = self.index;
-        for (sym, &l) in lengths.iter().enumerate() {
-            if l != 0 {
-                self.symbols[next[l as usize] as usize] = sym as u16;
-                next[l as usize] += 1;
-            }
-        }
-        for (v, q) in self.quick.iter_mut().enumerate() {
-            *q = 0;
-            let bits = (v as u32) << (MAX_CODE_LEN - QUICK_BITS);
-            if let Some((sym, len)) = Self::slow(&self.limit, &self.first, &self.index, &self.symbols, bits) {
-                if len <= QUICK_BITS {
-                    *q = sym << 4 | len as u16;
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn slow(limit: &[u32], first: &[u32], index: &[u32], symbols: &[u16], bits: u32) -> Option<(u16, u32)> {
-        let mut l = 1;
-        while l <= MAX_CODE_LEN as usize {
-            if bits < limit[l] {
-                let code = bits >> (MAX_CODE_LEN as usize - l);
-                let pos = index[l] as usize + code.wrapping_sub(first[l]) as usize;
-                return symbols.get(pos).map(|&s| (s, l as u32));
-            }
-            l += 1;
-        }
-        None
-    }
-
-    #[inline(always)]
-    fn decode(&self, inp: &mut Bits) -> u16 {
-        let bits = inp.peek32() >> (32 - MAX_CODE_LEN);
-        let q = self.quick[(bits >> (MAX_CODE_LEN - QUICK_BITS)) as usize];
-        if q != 0 {
-            inp.skip((q & 15) as u32);
-            return q >> 4;
-        }
-        match Self::slow(&self.limit, &self.first, &self.index, &self.symbols, bits) {
-            Some((s, l)) => {
-                inp.skip(l);
-                s
-            }
-            None => {
-                // Not a valid code: consume everything so the block ends.
-                inp.pos = u64::MAX / 2;
-                0
-            }
         }
     }
 }
@@ -945,16 +851,6 @@ fn apply_filter(kind: FilterKind, data: &mut Vec<u8>, file_pos: u64) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn huffman_canonical() {
-        // Lengths 2,1,3,3 give codes 10, 0, 110, 111.
-        let mut h = Huffman::default();
-        h.build(&[2, 1, 3, 3]);
-        let data = [0b1001_1011_1000_0000u16.to_be_bytes()[0], 0b1001_1011_1000_0000u16.to_be_bytes()[1]];
-        let mut b = Bits { data: &data, pos: 0 };
-        assert_eq!([h.decode(&mut b), h.decode(&mut b), h.decode(&mut b), h.decode(&mut b)], [0, 1, 2, 3]);
-    }
 
     #[test]
     fn delta_filter() {

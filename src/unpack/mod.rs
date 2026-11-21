@@ -5,8 +5,10 @@
 mod ppmd;
 mod rarvm;
 mod v15;
-mod v20;
 mod v30;
+mod bitstream;
+mod huffman;
+mod rar2;
 mod rar5;
 
 use crate::getbits::{BitInput, MAX_SIZE};
@@ -205,6 +207,8 @@ pub struct Unpack {
 
     max_user_threads: u32,
     rar5: rar5::Rar5,
+    rar2: Box<rar2::Rar2>,
+    stream: bitstream::StreamBits,
 
     pub alloc_win_size: u64,
     pub max_win_size: usize,
@@ -359,6 +363,8 @@ impl Unpack {
             last_filter: 0,
             max_user_threads: 1,
             rar5: rar5::Rar5::default(),
+            rar2: Box::default(),
+            stream: bitstream::StreamBits::default(),
             alloc_win_size: 0,
             max_win_size: 0,
             max_win_mask: 0,
@@ -418,7 +424,7 @@ impl Unpack {
         }
         match method {
             15 => self.unpack15(solid, io),
-            20 | 26 => self.unpack20(solid, io),
+            20 | 26 => self.unpack_rar2(solid, io),
             29 => self.unpack29(solid, io),
             50 | 70 => {
                 let mut win = std::mem::take(&mut self.window);
@@ -459,7 +465,6 @@ impl Unpack {
         self.read_top = 0;
         self.read_border = 0;
         self.block_header = UnpackBlockHeader { block_size: -1, ..Default::default() };
-        self.unp_init_data20(solid);
         self.unp_init_data30(solid);
     }
 
@@ -544,6 +549,72 @@ impl Unpack {
             pos = 0;
         }
         dec.decode_num[pos as usize] as u32
+    }
+
+    /// Prepares the shared LZ window for a file of the RAR 1.5-2.x decoders.
+    fn lz_start(&mut self, solid: bool) {
+        self.unp_init_data(solid);
+        self.unp_init_data15(solid);
+    }
+
+    /// Remembers that the window position wrapped around, after which
+    /// all distances up to the window size are valid.
+    #[inline(always)]
+    fn lz_track_wrap(&mut self) {
+        self.first_win_done |= self.prev_ptr > self.unp_ptr;
+        self.prev_ptr = self.unp_ptr;
+    }
+
+    #[inline(always)]
+    fn lz_put(&mut self, b: u8) {
+        self.window[self.unp_ptr] = b;
+        self.unp_ptr = (self.unp_ptr + 1) & self.max_win_mask;
+    }
+
+    /// Copies a match. A distance reaching before the start of the data
+    /// (or beyond the window) produces zeros.
+    #[inline(always)]
+    fn lz_copy(&mut self, len: u32, dist: usize) {
+        let len = len as usize;
+        let mask = self.max_win_mask;
+        let dst = self.unp_ptr;
+        if dist > dst && (dist > self.max_win_size || !self.first_win_done) {
+            for i in 0..len {
+                self.window[(dst + i) & mask] = 0;
+            }
+        } else {
+            let src = dst.wrapping_sub(dist) & mask;
+            if dist >= len && src + len <= self.max_win_size && dst + len <= self.max_win_size {
+                self.window.copy_within(src..src + len, dst);
+            } else {
+                for i in 0..len {
+                    self.window[(dst + i) & mask] = self.window[(src + i) & mask];
+                }
+            }
+        }
+        self.unp_ptr = (dst + len) & mask;
+    }
+
+    /// Writes the decoded part of the window when it is nearly full, so the
+    /// next match cannot overwrite unwritten data.
+    #[inline(always)]
+    fn lz_flush_if_full(&mut self, io: &mut dyn UnpackIo) {
+        if (self.unp_ptr.wrapping_sub(self.wr_ptr) & self.max_win_mask) + 0x1000 >= self.max_win_size {
+            self.lz_flush(io);
+        }
+    }
+
+    fn lz_flush(&mut self, io: &mut dyn UnpackIo) {
+        if self.unp_ptr != self.wr_ptr {
+            self.unp_some_read = true;
+        }
+        if self.unp_ptr < self.wr_ptr {
+            io.unp_write(&self.window[self.wr_ptr..self.max_win_size]);
+            io.unp_write(&self.window[..self.unp_ptr]);
+        } else {
+            io.unp_write(&self.window[self.wr_ptr..self.unp_ptr]);
+        }
+        self.wr_ptr = self.unp_ptr;
     }
 
     #[inline(always)]
