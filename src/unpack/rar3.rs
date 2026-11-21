@@ -645,7 +645,6 @@ impl Unpack {
                     let stop = (off + out.1 as usize).min(VM_SIZE + 4);
                     io.unp_write(&st.mem[off..stop]);
                 }
-                self.unp_some_read = true;
                 self.written_file_size += out.1 as i64;
                 border = end;
                 avail = self.unp_ptr.wrapping_sub(border) & mask;
@@ -658,9 +657,6 @@ impl Unpack {
 
     /// Writes window data `[from, to)`, not past the file size.
     fn write_window3(&mut self, from: usize, to: usize, io: &mut dyn UnpackIo) {
-        if from != to {
-            self.unp_some_read = true;
-        }
         let w = std::mem::take(&mut self.window);
         if to < from {
             self.write_limited3(&w[from..self.max_win_size], io);

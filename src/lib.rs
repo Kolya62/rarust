@@ -21,7 +21,6 @@ pub mod filcreat;
 pub mod file;
 pub mod filefn;
 pub mod find;
-pub mod getbits;
 pub mod hash;
 pub mod headers;
 pub mod list;

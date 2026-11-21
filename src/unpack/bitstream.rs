@@ -87,18 +87,8 @@ impl StreamBits {
         self.pos = (self.pos + 7) & !7;
     }
 
-    pub fn byte_pos(&self) -> usize {
-        (self.pos >> 3) as usize
-    }
 
-    /// The buffered bytes starting at the current byte position.
-    pub fn buffered(&self) -> &[u8] {
-        &self.buf[self.byte_pos().min(self.len)..self.len]
-    }
 
-    pub fn skip_bytes(&mut self, n: usize) {
-        self.pos += n as u64 * 8;
-    }
 }
 
 impl BitSource for StreamBits {
