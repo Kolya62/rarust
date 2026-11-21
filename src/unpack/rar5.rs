@@ -20,6 +20,8 @@
 //! matches (262+).
 
 use super::UnpackIo;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Main code: 256 literals, filter, last match, 4 recent distances,
 /// 44 length slots.
@@ -45,6 +47,126 @@ const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u32 = 0x40_0000;
 /// Unflushed output is written once it reaches this size.
 const FLUSH_SIZE: u64 = 0x40_0000;
+/// Packed bytes per thread decoded in one parallel batch.
+const BATCH_PER_THREAD: usize = 0x10_0000;
+
+/// One decoded symbol of the main code. Parsing a block into operations
+/// needs only its Huffman tables, so blocks can be parsed in parallel;
+/// operations are then applied to the dictionary in order.
+#[derive(Clone, Copy)]
+enum Op {
+    Literal(u8),
+    /// The next `n` bytes of the job's literal buffer.
+    Literals(u32),
+    Filter { kind: FilterKind, offset: u64, len: u32 },
+    /// Repeat the last match.
+    RepeatLast,
+    /// Match with recent distance number `idx`.
+    Recent { idx: u8, len: u32 },
+    Match { len: u32, dist: u64 },
+}
+
+/// Decodes the next operation from a block.
+#[inline(always)]
+fn next_op(inp: &mut Bits, t: &Tables) -> Option<Op> {
+    let sym = t.main.decode(inp) as u32;
+    Some(match sym {
+        0..=255 => Op::Literal(sym as u8),
+        256 => {
+            // Start offset from the current position, length, 3-bit
+            // type, and for delta the channel count.
+            fn number(inp: &mut Bits) -> u32 {
+                let bytes = inp.take(2) + 1;
+                (0..bytes).fold(0, |v, i| v | inp.take(8) << (i * 8))
+            }
+            let offset = number(inp) as u64;
+            let len = number(inp);
+            let kind = match inp.take(3) {
+                0 => FilterKind::Delta(inp.take(5) + 1),
+                1 => FilterKind::E8,
+                2 => FilterKind::E8E9,
+                3 => FilterKind::Arm,
+                _ => return None, // Unknown filter: ignored.
+            };
+            Op::Filter { kind, offset, len }
+        }
+        257 => Op::RepeatLast,
+        258..=261 => {
+            let slot = t.rep_len.decode(inp) as u32;
+            Op::Recent { idx: (sym - 258) as u8, len: slot_length(inp, slot) }
+        }
+        _ => {
+            let mut len = slot_length(inp, sym - 262);
+            let dist = distance(inp, t);
+            if dist > 0x100 {
+                len += 1 + (dist > 0x2000) as u32 + (dist > 0x40000) as u32;
+            }
+            Op::Match { len, dist }
+        }
+    })
+}
+
+/// Distance of a new match. Slots 0-3 are distances 1-4; each further
+/// pair of slots doubles the range. With 4 or more extra bits the lowest
+/// 4 are coded separately by the low distance code.
+#[inline(always)]
+fn distance(inp: &mut Bits, t: &Tables) -> u64 {
+    let slot = t.dist.decode(inp) as u32;
+    if slot < 4 {
+        return slot as u64 + 1;
+    }
+    let extra = slot / 2 - 1;
+    let mut dist = ((2 | (slot & 1)) as u64) << extra;
+    if extra >= 4 {
+        if extra > 4 {
+            dist += inp.take_long(extra - 4) << 4;
+        }
+        dist += t.low_dist.decode(inp) as u64;
+    } else {
+        dist += inp.take(extra) as u64;
+    }
+    dist + 1
+}
+
+/// Longest literal run stored as one operation; below `MAX_MATCH`, so the
+/// flush rules for matches cover it.
+const MAX_LITERAL_RUN: u32 = 0x1000;
+
+/// Operations of one block and the bytes of its literal runs.
+#[derive(Default)]
+struct Parsed {
+    ops: Vec<Op>,
+    literals: Vec<u8>,
+}
+
+/// A block read and prepared for parallel parsing.
+struct Job {
+    data: Vec<u8>,
+    start: u64,
+    bit_len: u64,
+    tables: Arc<Tables>,
+}
+
+impl Job {
+    fn parse(&self) -> Parsed {
+        let mut inp = Bits { data: &self.data, pos: self.start };
+        let mut p = Parsed { ops: Vec::with_capacity(self.data.len() / 4), literals: Vec::with_capacity(self.data.len()) };
+        while inp.pos < self.bit_len {
+            match next_op(&mut inp, &self.tables) {
+                Some(Op::Literal(b)) => {
+                    p.literals.push(b);
+                    match p.ops.last_mut() {
+                        Some(Op::Literals(n)) if *n < MAX_LITERAL_RUN => *n += 1,
+                        _ => p.ops.push(Op::Literals(1)),
+                    }
+                }
+                Some(op) => p.ops.push(op),
+                None => {}
+            }
+        }
+        p
+    }
+}
 
 /// MSB-first reader over one block. Reads past the end return zero bits, so
 /// corrupt data can never index outside the buffer.
@@ -235,7 +357,7 @@ fn slot_length(inp: &mut Bits, slot: u32) -> u32 {
 }
 
 pub(super) struct Rar5 {
-    tables: Box<Tables>,
+    tables: Arc<Tables>,
     tables_ok: bool,
     /// Bytes decoded since the dictionary was created.
     pos: u64,
@@ -254,7 +376,7 @@ pub(super) struct Rar5 {
 impl Default for Rar5 {
     fn default() -> Self {
         Rar5 {
-            tables: Box::default(),
+            tables: Arc::default(),
             tables_ok: false,
             pos: 0,
             flushed: 0,
@@ -310,6 +432,7 @@ impl Rar5 {
         window: &mut [u8],
         solid: bool,
         large_dist: bool,
+        threads: usize,
         dest_size: i64,
         io: &mut dyn UnpackIo,
     ) {
@@ -321,14 +444,24 @@ impl Rar5 {
         self.file_start = self.pos;
         self.written = 0;
         let input = Input { io, buf: Vec::new(), pos: 0, len: 0 };
-        let mut dec = Decoder { st: self, win: window, dest_size, input };
-        dec.run(large_dist);
+        let wpos = (self.pos % window.len() as u64) as usize;
+        let flush_limit = (window.len() as u64 / 2).min(FLUSH_SIZE);
+        let mut dec = Decoder { st: self, win: window, wpos, flush_limit, dest_size, input };
+        if threads > 1 {
+            dec.run_parallel(large_dist, threads);
+        } else {
+            dec.run(large_dist);
+        }
     }
 }
 
 struct Decoder<'a> {
     st: &'a mut Rar5,
     win: &'a mut [u8],
+    /// `st.pos` modulo the window size.
+    wpos: usize,
+    /// Unflushed size that triggers a flush.
+    flush_limit: u64,
     dest_size: i64,
     input: Input<'a>,
 }
@@ -340,12 +473,21 @@ impl Decoder<'_> {
         while let Some((bit_len, last, has_tables)) = self.read_block(&mut block) {
             let mut inp = Bits { data: &block, pos: 0 };
             if has_tables {
-                if !self.read_tables(&mut inp, dist_codes) {
-                    break;
-                }
+                let Some(t) = read_tables(&mut inp, dist_codes) else { break };
+                self.st.tables = Arc::new(t);
                 self.st.tables_ok = true;
             }
-            if !self.st.tables_ok || !self.decode_block(&mut inp, bit_len) {
+            if !self.st.tables_ok {
+                break;
+            }
+            let tables = self.st.tables.clone();
+            let mut ok = true;
+            while ok && inp.pos < bit_len {
+                if let Some(op) = next_op(&mut inp, &tables) {
+                    ok = self.apply(op, &mut &[][..]);
+                }
+            }
+            if !ok {
                 break;
             }
             if last {
@@ -354,6 +496,69 @@ impl Decoder<'_> {
         }
         self.st.block = block;
         self.flush(true);
+    }
+
+    /// Reads blocks and Huffman tables for one batch. Returns the jobs and
+    /// whether the input ended.
+    fn read_batch(&mut self, dist_codes: usize, threads: usize) -> (Vec<Job>, bool) {
+        let mut jobs = Vec::new();
+        let mut bytes = 0;
+        while jobs.len() < threads * 8 && bytes < threads * BATCH_PER_THREAD {
+            let mut data = Vec::new();
+            let Some((bit_len, last, has_tables)) = self.read_block(&mut data) else { return (jobs, true) };
+            let mut inp = Bits { data: &data, pos: 0 };
+            if has_tables {
+                let Some(t) = read_tables(&mut inp, dist_codes) else { return (jobs, true) };
+                self.st.tables = Arc::new(t);
+                self.st.tables_ok = true;
+            }
+            if !self.st.tables_ok {
+                return (jobs, true);
+            }
+            let start = inp.pos;
+            bytes += data.len();
+            jobs.push(Job { data, start, bit_len, tables: self.st.tables.clone() });
+            if last {
+                return (jobs, true);
+            }
+        }
+        (jobs, false)
+    }
+
+    /// Pipeline: while batch N is applied to the dictionary on this thread,
+    /// worker threads parse batch N + 1.
+    fn run_parallel(&mut self, large_dist: bool, threads: usize) {
+        let dist_codes = if large_dist { DIST_CODES_70 } else { DIST_CODES_50 };
+        let mut pending: Option<Pending> = None;
+        loop {
+            let (jobs, done) = self.read_batch(dist_codes, threads);
+            let started = (!jobs.is_empty()).then(|| Pending::start(jobs, threads));
+            if let Some(p) = pending.take() {
+                if !self.apply_all(p.finish()) {
+                    break;
+                }
+            }
+            pending = started;
+            if done {
+                if let Some(p) = pending.take() {
+                    self.apply_all(p.finish());
+                }
+                break;
+            }
+        }
+        self.flush(true);
+    }
+
+    fn apply_all(&mut self, parsed: Vec<Parsed>) -> bool {
+        for p in parsed {
+            let mut lits = &p.literals[..];
+            for &op in &p.ops {
+                if !self.apply(op, &mut lits) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Reads the next block header and data. Returns the number of data
@@ -387,161 +592,74 @@ impl Decoder<'_> {
         Some((bit_len, flags & 0x40 != 0, flags & 0x80 != 0))
     }
 
-    fn read_tables(&mut self, inp: &mut Bits, dist_codes: usize) -> bool {
-        // Bit lengths of the level code: 4 bits each, 15 is followed by a
-        // 4-bit count of zero lengths (count 0 means the length is 15).
-        let mut level = [0u8; LEVEL_CODES];
-        let mut i = 0;
-        while i < LEVEL_CODES {
-            let l = inp.take(4) as u8;
-            if l == 15 {
-                let zeros = inp.take(4) as usize;
-                if zeros == 0 {
-                    level[i] = 15;
-                    i += 1;
-                } else {
-                    let end = (i + zeros + 2).min(LEVEL_CODES);
-                    level[i..end].fill(0);
-                    i = end;
-                }
-            } else {
-                level[i] = l;
-                i += 1;
-            }
-        }
-        let mut level_code = Huffman::default();
-        level_code.build(&level);
-
-        let total = MAIN_CODES + dist_codes + LOW_DIST_CODES + REP_LEN_CODES;
-        let mut lens = vec![0u8; total];
-        let mut i = 0;
-        while i < total {
-            let sym = level_code.decode(inp);
-            match sym {
-                0..=15 => {
-                    lens[i] = sym as u8;
-                    i += 1;
-                }
-                16 | 17 => {
-                    // Repeat the previous length.
-                    let n = if sym == 16 { 3 + inp.take(3) } else { 11 + inp.take(7) } as usize;
-                    if i == 0 {
-                        return false;
-                    }
-                    let prev = lens[i - 1];
-                    let end = (i + n).min(total);
-                    lens[i..end].fill(prev);
-                    i = end;
-                }
-                _ => {
-                    // Run of zero lengths.
-                    let n = if sym == 18 { 3 + inp.take(3) } else { 11 + inp.take(7) } as usize;
-                    let end = (i + n).min(total);
-                    lens[i..end].fill(0);
-                    i = end;
-                }
-            }
-        }
-        let (main, rest) = lens.split_at(MAIN_CODES);
-        let (dist, rest) = rest.split_at(dist_codes);
-        let (low, rep) = rest.split_at(LOW_DIST_CODES);
-        let t = &mut self.st.tables;
-        t.main.build(main);
-        t.dist.build(dist);
-        t.low_dist.build(low);
-        t.rep_len.build(rep);
-        true
-    }
-
-    fn decode_block(&mut self, inp: &mut Bits, bit_len: u64) -> bool {
-        let tables = std::mem::take(&mut self.st.tables);
-        let ok = self.decode_symbols(inp, bit_len, &tables);
-        self.st.tables = tables;
-        ok
-    }
-
-    fn decode_symbols(&mut self, inp: &mut Bits, bit_len: u64, t: &Tables) -> bool {
-        let win_len = self.win.len() as u64;
-        let flush_at = (win_len / 2).min(FLUSH_SIZE);
-        while inp.pos < bit_len {
-            if self.st.pos - self.st.flushed >= flush_at {
-                self.flush(false);
-                if self.st.pos - self.st.flushed + MAX_MATCH >= win_len {
-                    return false;
-                }
-            }
-            let sym = t.main.decode(inp) as u32;
-            match sym {
-                0..=255 => {
-                    let p = (self.st.pos % win_len) as usize;
-                    self.win[p] = sym as u8;
-                    self.st.pos += 1;
-                }
-                256 => {
-                    if !self.read_filter(inp) {
-                        return false;
-                    }
-                }
-                257 => {
-                    if self.st.last_len != 0 {
-                        self.copy(self.st.last_len, self.st.recent[0]);
-                    }
-                }
-                258..=261 => {
-                    let i = (sym - 258) as usize;
-                    let dist = self.st.recent[i];
-                    self.st.recent.copy_within(0..i, 1);
-                    self.st.recent[0] = dist;
-                    let slot = t.rep_len.decode(inp) as u32;
-                    let len = slot_length(inp, slot);
-                    self.st.last_len = len;
-                    self.copy(len, dist);
-                }
-                _ => {
-                    let mut len = slot_length(inp, sym - 262);
-                    let dist = Self::distance(inp, t);
-                    if dist > 0x100 {
-                        len += 1 + (dist > 0x2000) as u32 + (dist > 0x40000) as u32;
-                    }
-                    self.st.recent.copy_within(0..3, 1);
-                    self.st.recent[0] = dist;
-                    self.st.last_len = len;
-                    self.copy(len, dist);
-                }
-            }
-        }
-        true
-    }
-
-    /// Distance of a new match. Slots 0-3 are distances 1-4; each further
-    /// pair of slots doubles the range. With 4 or more extra bits the
-    /// lowest 4 are coded separately by the low distance code.
+    /// Applies one operation to the dictionary. Returns false if decoding
+    /// cannot continue.
     #[inline(always)]
-    fn distance(inp: &mut Bits, t: &Tables) -> u64 {
-        let slot = t.dist.decode(inp) as u32;
-        if slot < 4 {
-            return slot as u64 + 1;
-        }
-        let extra = slot / 2 - 1;
-        let mut dist = ((2 | (slot & 1)) as u64) << extra;
-        if extra >= 4 {
-            if extra > 4 {
-                dist += inp.take_long(extra - 4) << 4;
+    fn apply(&mut self, op: Op, lits: &mut &[u8]) -> bool {
+        if self.st.pos - self.st.flushed >= self.flush_limit {
+            self.flush(false);
+            if self.st.pos - self.st.flushed + MAX_MATCH >= self.win.len() as u64 {
+                return false;
             }
-            dist += t.low_dist.decode(inp) as u64;
-        } else {
-            dist += inp.take(extra) as u64;
         }
-        dist + 1
+        match op {
+            Op::Literal(b) => {
+                self.win[self.wpos] = b;
+                self.advance(1);
+            }
+            Op::Literals(n) => {
+                let n = (n as usize).min(lits.len());
+                let (run, rest) = lits.split_at(n);
+                *lits = rest;
+                let first = run.len().min(self.win.len() - self.wpos);
+                self.win[self.wpos..self.wpos + first].copy_from_slice(&run[..first]);
+                self.win[..run.len() - first].copy_from_slice(&run[first..]);
+                self.advance(run.len());
+            }
+            Op::Filter { kind, offset, len } => return self.add_filter(kind, offset, len),
+            Op::RepeatLast => {
+                if self.st.last_len != 0 {
+                    self.copy(self.st.last_len, self.st.recent[0]);
+                }
+            }
+            Op::Recent { idx, len } => {
+                let i = idx as usize;
+                let dist = self.st.recent[i];
+                self.st.recent.copy_within(0..i, 1);
+                self.st.recent[0] = dist;
+                self.st.last_len = len;
+                self.copy(len, dist);
+            }
+            Op::Match { len, dist } => {
+                self.st.recent.copy_within(0..3, 1);
+                self.st.recent[0] = dist;
+                self.st.last_len = len;
+                self.copy(len, dist);
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn advance(&mut self, n: usize) {
+        self.st.pos += n as u64;
+        self.wpos += n;
+        if self.wpos >= self.win.len() {
+            self.wpos -= self.win.len();
+        }
     }
 
     #[inline(always)]
     fn copy(&mut self, len: u32, dist: u64) {
-        let n = self.win.len() as u64;
-        let dst = (self.st.pos % n) as usize;
-        // Distances beyond the dictionary come from corrupt data; reduce
-        // them modulo the dictionary size so indices stay in range.
-        let src = ((self.st.pos + n - dist % n) % n) as usize;
+        let n = self.win.len();
+        let dst = self.wpos;
+        let src = if dist <= dst as u64 {
+            dst - dist as usize
+        } else {
+            // Wraps around; distances beyond the dictionary come from
+            // corrupt data and are reduced so indices stay in range.
+            (dst + n - (dist % n as u64) as usize) % n
+        };
         let len_u = len as usize;
         if dist >= len as u64 && src + len_u <= self.win.len() && dst + len_u <= self.win.len() {
             self.win.copy_within(src..src + len_u, dst);
@@ -559,25 +677,10 @@ impl Decoder<'_> {
                 }
             }
         }
-        self.st.pos += len as u64;
+        self.advance(len as usize);
     }
 
-    /// Filter parameters: start offset from the current position, length,
-    /// 3-bit type, and for delta the channel count.
-    fn read_filter(&mut self, inp: &mut Bits) -> bool {
-        fn number(inp: &mut Bits) -> u32 {
-            let bytes = inp.take(2) + 1;
-            (0..bytes).fold(0, |v, i| v | inp.take(8) << (i * 8))
-        }
-        let offset = number(inp) as u64;
-        let len = number(inp);
-        let kind = match inp.take(3) {
-            0 => FilterKind::Delta(inp.take(5) + 1),
-            1 => FilterKind::E8,
-            2 => FilterKind::E8E9,
-            3 => FilterKind::Arm,
-            _ => return true, // Unknown filter: ignored.
-        };
+    fn add_filter(&mut self, kind: FilterKind, offset: u64, len: u32) -> bool {
         if self.st.filters.len() >= MAX_FILTERS {
             self.flush(false);
             if self.st.filters.len() >= MAX_FILTERS {
@@ -665,6 +768,114 @@ impl Decoder<'_> {
         if end {
             self.st.filters.clear();
         }
+    }
+}
+
+/// Reads the Huffman tables at the start of a block.
+fn read_tables(inp: &mut Bits, dist_codes: usize) -> Option<Tables> {
+    // Bit lengths of the level code: 4 bits each, 15 is followed by a
+    // 4-bit count of zero lengths (count 0 means the length is 15).
+    let mut level = [0u8; LEVEL_CODES];
+    let mut i = 0;
+    while i < LEVEL_CODES {
+        let l = inp.take(4) as u8;
+        if l == 15 {
+            let zeros = inp.take(4) as usize;
+            if zeros == 0 {
+                level[i] = 15;
+                i += 1;
+            } else {
+                let end = (i + zeros + 2).min(LEVEL_CODES);
+                level[i..end].fill(0);
+                i = end;
+            }
+        } else {
+            level[i] = l;
+            i += 1;
+        }
+    }
+    let mut level_code = Huffman::default();
+    level_code.build(&level);
+
+    let total = MAIN_CODES + dist_codes + LOW_DIST_CODES + REP_LEN_CODES;
+    let mut lens = vec![0u8; total];
+    let mut i = 0;
+    while i < total {
+        let sym = level_code.decode(inp);
+        match sym {
+            0..=15 => {
+                lens[i] = sym as u8;
+                i += 1;
+            }
+            16 | 17 => {
+                // Repeat the previous length.
+                let n = if sym == 16 { 3 + inp.take(3) } else { 11 + inp.take(7) } as usize;
+                if i == 0 {
+                    return None;
+                }
+                let prev = lens[i - 1];
+                let end = (i + n).min(total);
+                lens[i..end].fill(prev);
+                i = end;
+            }
+            _ => {
+                // Run of zero lengths.
+                let n = if sym == 18 { 3 + inp.take(3) } else { 11 + inp.take(7) } as usize;
+                let end = (i + n).min(total);
+                lens[i..end].fill(0);
+                i = end;
+            }
+        }
+    }
+    let (main, rest) = lens.split_at(MAIN_CODES);
+    let (dist, rest) = rest.split_at(dist_codes);
+    let (low, rep) = rest.split_at(LOW_DIST_CODES);
+    let mut t = Tables::default();
+    t.main.build(main);
+    t.dist.build(dist);
+    t.low_dist.build(low);
+    t.rep_len.build(rep);
+    Some(t)
+}
+
+/// A batch being parsed by worker threads.
+struct Pending {
+    workers: Vec<std::thread::JoinHandle<Vec<(usize, Parsed)>>>,
+    count: usize,
+}
+
+impl Pending {
+    fn start(jobs: Vec<Job>, threads: usize) -> Pending {
+        let count = jobs.len();
+        let jobs = Arc::new(jobs);
+        let next = Arc::new(AtomicUsize::new(0));
+        let workers = (0..threads.min(count))
+            .map(|_| {
+                let (jobs, next) = (jobs.clone(), next.clone());
+                std::thread::spawn(move || {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(i) else { break };
+                        out.push((i, job.parse()));
+                    }
+                    out
+                })
+            })
+            .collect();
+        Pending { workers, count }
+    }
+
+    /// Waits for the workers; results are in block order.
+    fn finish(self) -> Vec<Parsed> {
+        let mut slots: Vec<Option<Parsed>> = (0..self.count).map(|_| None).collect();
+        for w in self.workers {
+            for (i, p) in w.join().unwrap_or_default() {
+                slots[i] = Some(p);
+            }
+        }
+        // A missing result (a panicked worker) ends the batch there.
+        slots.into_iter().map_while(|p| p).collect()
     }
 }
 

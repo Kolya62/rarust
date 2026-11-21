@@ -35,6 +35,7 @@ fn main() {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).unwrap();
     let mut u = Unpack::new();
+    u.set_threads(std::env::var("THREADS").map_or(1, |t| t.parse().unwrap()));
     let part = input.len() / files;
     let mut stdout = std::io::stdout();
     for i in 0..files {

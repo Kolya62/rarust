@@ -423,7 +423,7 @@ impl Unpack {
             50 | 70 => {
                 let mut win = std::mem::take(&mut self.window);
                 let n = self.max_win_size.min(win.len());
-                self.rar5.unpack(&mut win[..n], solid, method == 70, self.dest_unp_size, io);
+                self.rar5.unpack(&mut win[..n], solid, method == 70, self.max_user_threads as usize, self.dest_unp_size, io);
                 self.window = win;
                 self.file_extracted = true;
             }
