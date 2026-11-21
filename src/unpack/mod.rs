@@ -3,16 +3,14 @@
 //! Decompression of RAR 1.5, 2.x, 3.x, 5.0 and 7.0 data.
 
 mod ppmd;
-mod rarvm;
 mod v15;
-mod v30;
 mod bitstream;
 mod huffman;
 mod rar2;
+mod rar3;
 mod rar5;
 
 use crate::getbits::{BitInput, MAX_SIZE};
-use rarvm::{RarVM, VmPreparedProgram};
 
 /// Source of packed data and destination of unpacked data.
 pub trait UnpackIo {
@@ -91,15 +89,6 @@ pub struct UnpackBlockTables {
     pub ldd: DecodeTable,
     pub rd: DecodeTable,
     pub bd: DecodeTable,
-}
-
-#[derive(Clone, Default)]
-pub struct UnpackFilter30 {
-    pub block_start: u32,
-    pub block_length: u32,
-    pub next_window: bool,
-    pub parent_filter: u32,
-    pub prg: VmPreparedProgram,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -190,24 +179,12 @@ pub struct Unpack {
     aud_v: [AudioVariables; 4],
 
     // Unpack v3.0.
-    prev_low_dist: i32,
-    low_dist_rep_count: i32,
-    ppm: Box<ppmd::ModelPPM>,
-    ppm_esc_char: i32,
-    unp_old_table: [u8; HUFF_TABLE_SIZE30],
-    unp_block_ppm: bool,
     tables_read2: bool,
-    tables_read3: bool,
-    vm: RarVM,
-    vm_code_inp: BitInput,
-    filters30: Vec<UnpackFilter30>,
-    prg_stack: Vec<Option<Box<UnpackFilter30>>>,
-    old_filter_lengths: Vec<u32>,
-    last_filter: u32,
 
     max_user_threads: u32,
     rar5: rar5::Rar5,
     rar2: Box<rar2::Rar2>,
+    rar3: Box<rar3::Rar3>,
     stream: bitstream::StreamBits,
 
     pub alloc_win_size: u64,
@@ -252,42 +229,6 @@ fn read_buf(
         *read_border = (*read_border).min(block_header.block_start + block_header.block_size - 1);
     }
     read_code != -1
-}
-
-/// Byte input of PPM decoder: the bit input buffer of Unpack, refilled
-/// from packed data when needed.
-struct PpmInput<'a> {
-    inp: &'a mut BitInput,
-    read_top: &'a mut i64,
-    read_border: &'a mut i64,
-    block_header: &'a mut UnpackBlockHeader,
-    io: &'a mut dyn UnpackIo,
-}
-
-impl PpmInput<'_> {
-    #[cold]
-    #[inline(never)]
-    fn refill_byte(&mut self) -> u8 {
-        read_buf(self.inp, self.read_top, self.read_border, self.block_header, self.io);
-        let a = self.inp.in_addr;
-        if a >= MAX_SIZE {
-            return 0;
-        }
-        self.inp.in_addr = a + 1;
-        self.inp.in_buf[a]
-    }
-}
-
-impl ppmd::ByteReader for PpmInput<'_> {
-    #[inline(always)]
-    fn byte(&mut self) -> u8 {
-        let a = self.inp.in_addr;
-        if a > MAX_SIZE - 30 {
-            return self.refill_byte();
-        }
-        self.inp.in_addr = a + 1;
-        self.inp.in_buf[a]
-    }
 }
 
 impl Default for Unpack {
@@ -347,23 +288,11 @@ impl Unpack {
             unp_cur_channel: 0,
             unp_channel_delta: 0,
             aud_v: [AudioVariables::default(); 4],
-            prev_low_dist: 0,
-            low_dist_rep_count: 0,
-            ppm: Box::default(),
-            ppm_esc_char: 0,
-            unp_old_table: [0; HUFF_TABLE_SIZE30],
-            unp_block_ppm: false,
             tables_read2: false,
-            tables_read3: false,
-            vm: RarVM::new(),
-            vm_code_inp: BitInput::new(),
-            filters30: Vec::new(),
-            prg_stack: Vec::new(),
-            old_filter_lengths: Vec::new(),
-            last_filter: 0,
             max_user_threads: 1,
             rar5: rar5::Rar5::default(),
             rar2: Box::default(),
+            rar3: Box::default(),
             stream: bitstream::StreamBits::default(),
             alloc_win_size: 0,
             max_win_size: 0,
@@ -425,7 +354,7 @@ impl Unpack {
         match method {
             15 => self.unpack15(solid, io),
             20 | 26 => self.unpack_rar2(solid, io),
-            29 => self.unpack29(solid, io),
+            29 => self.unpack_rar3(solid, io),
             50 | 70 => {
                 let mut win = std::mem::take(&mut self.window);
                 let n = self.max_win_size.min(win.len());
@@ -465,7 +394,6 @@ impl Unpack {
         self.read_top = 0;
         self.read_border = 0;
         self.block_header = UnpackBlockHeader { block_size: -1, ..Default::default() };
-        self.unp_init_data30(solid);
     }
 
     /// Build Huffman decoding tables from bit lengths.
