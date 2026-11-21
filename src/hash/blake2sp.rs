@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! BLAKE2sp hash as used by RAR 5.0.
+//! BLAKE2sp (RFC 7693 BLAKE2s run as 8 parallel leaves plus a root node).
 
 const BLOCK: usize = 64;
 const OUT: usize = 32;
-const PAR: usize = 8;
+const LEAVES: usize = 8;
+const STRIPE: usize = LEAVES * BLOCK;
 
-const IV: [u32; 8] = [
-    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
-];
+const IV: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
 
-const SIGMA: [[u8; 16]; 10] = [
+const SIGMA: [[usize; 16]; 10] = [
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
     [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
@@ -23,65 +22,73 @@ const SIGMA: [[u8; 16]; 10] = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
 ];
 
+/// One BLAKE2s node. The most recent block is kept unprocessed until more
+/// data arrives, because the final block must be compressed with the
+/// finalization flag set.
 #[derive(Clone)]
-struct Blake2s {
-    buf: [u8; 2 * BLOCK],
+struct Node {
     h: [u32; 8],
-    t: [u32; 2],
-    f: [u32; 2],
-    buflen: usize,
+    t: u64,
     last_node: bool,
+    buf: [u8; BLOCK],
+    len: usize,
 }
 
-impl Blake2s {
-    fn new(node_offset: u32, node_depth: u32) -> Self {
+impl Node {
+    fn new(offset: u32, depth: u8, last_node: bool) -> Node {
+        let p = [
+            OUT as u32 | (LEAVES as u32) << 16 | 2 << 24, // digest length, key length 0, fanout, depth
+            0,                                            // leaf length
+            offset,                                       // node offset (low 32 bits)
+            (depth as u32) << 16 | (OUT as u32) << 24,    // node depth, inner length
+            0,
+            0,
+            0,
+            0,
+        ];
         let mut h = IV;
-        h[0] ^= 0x02080020;
-        h[2] ^= node_offset;
-        h[3] ^= (node_depth << 16) | 0x20000000;
-        Blake2s { buf: [0; 2 * BLOCK], h, t: [0; 2], f: [0; 2], buflen: 0, last_node: false }
-    }
-
-    fn inc(&mut self, inc: u32) {
-        self.t[0] = self.t[0].wrapping_add(inc);
-        if self.t[0] < inc {
-            self.t[1] = self.t[1].wrapping_add(1);
+        for (x, y) in h.iter_mut().zip(p) {
+            *x ^= y;
         }
+        Node { h, t: 0, last_node, buf: [0; BLOCK], len: 0 }
     }
 
-    fn compress(&mut self, block_from_buf_start: bool) {
-        let _ = block_from_buf_start;
+    fn compress(&mut self, block: &[u8; BLOCK], last: bool) {
         let mut m = [0u32; 16];
-        for (i, w) in m.iter_mut().enumerate() {
-            *w = u32::from_le_bytes(self.buf[i * 4..i * 4 + 4].try_into().unwrap());
+        for (i, x) in m.iter_mut().enumerate() {
+            *x = u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap());
         }
         let mut v = [0u32; 16];
         v[..8].copy_from_slice(&self.h);
-        v[8..12].copy_from_slice(&IV[..4]);
-        v[12] = self.t[0] ^ IV[4];
-        v[13] = self.t[1] ^ IV[5];
-        v[14] = self.f[0] ^ IV[6];
-        v[15] = self.f[1] ^ IV[7];
+        v[8..].copy_from_slice(&IV);
+        v[12] ^= self.t as u32;
+        v[13] ^= (self.t >> 32) as u32;
+        if last {
+            v[14] = !v[14];
+            if self.last_node {
+                v[15] = !v[15];
+            }
+        }
         #[inline(always)]
-        fn g(v: &mut [u32; 16], m: &[u32; 16], s: &[u8; 16], i: usize, a: usize, b: usize, c: usize, d: usize) {
-            v[a] = v[a].wrapping_add(v[b]).wrapping_add(m[s[2 * i] as usize]);
+        fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+            v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
             v[d] = (v[d] ^ v[a]).rotate_right(16);
             v[c] = v[c].wrapping_add(v[d]);
             v[b] = (v[b] ^ v[c]).rotate_right(12);
-            v[a] = v[a].wrapping_add(v[b]).wrapping_add(m[s[2 * i + 1] as usize]);
+            v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
             v[d] = (v[d] ^ v[a]).rotate_right(8);
             v[c] = v[c].wrapping_add(v[d]);
             v[b] = (v[b] ^ v[c]).rotate_right(7);
         }
-        for s in SIGMA.iter() {
-            g(&mut v, &m, s, 0, 0, 4, 8, 12);
-            g(&mut v, &m, s, 1, 1, 5, 9, 13);
-            g(&mut v, &m, s, 2, 2, 6, 10, 14);
-            g(&mut v, &m, s, 3, 3, 7, 11, 15);
-            g(&mut v, &m, s, 4, 0, 5, 10, 15);
-            g(&mut v, &m, s, 5, 1, 6, 11, 12);
-            g(&mut v, &m, s, 6, 2, 7, 8, 13);
-            g(&mut v, &m, s, 7, 3, 4, 9, 14);
+        for s in &SIGMA {
+            g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+            g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+            g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+            g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+            g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+            g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+            g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+            g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
         }
         for i in 0..8 {
             self.h[i] ^= v[i] ^ v[i + 8];
@@ -90,54 +97,39 @@ impl Blake2s {
 
     fn update(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
-            let left = self.buflen;
-            let fill = 2 * BLOCK - left;
-            if data.len() > fill {
-                self.buf[left..].copy_from_slice(&data[..fill]);
-                self.buflen += fill;
-                self.inc(BLOCK as u32);
-                self.compress(true);
-                self.buf.copy_within(BLOCK.., 0);
-                self.buflen -= BLOCK;
-                data = &data[fill..];
-            } else {
-                self.buf[left..left + data.len()].copy_from_slice(data);
-                self.buflen += data.len();
-                data = &[];
+            if self.len == BLOCK {
+                self.t += BLOCK as u64;
+                let b = self.buf;
+                self.compress(&b, false);
+                self.len = 0;
             }
+            let n = (BLOCK - self.len).min(data.len());
+            self.buf[self.len..self.len + n].copy_from_slice(&data[..n]);
+            self.len += n;
+            data = &data[n..];
         }
     }
 
-    fn finalize(&mut self) -> [u8; OUT] {
-        if self.buflen > BLOCK {
-            self.inc(BLOCK as u32);
-            self.compress(true);
-            self.buflen -= BLOCK;
-            self.buf.copy_within(BLOCK..BLOCK + self.buflen, 0);
-        }
-        self.inc(self.buflen as u32);
-        if self.last_node {
-            self.f[1] = !0;
-        }
-        self.f[0] = !0;
-        for b in &mut self.buf[self.buflen..] {
-            *b = 0;
-        }
-        self.compress(true);
+    fn finalize(mut self) -> [u8; OUT] {
+        self.t += self.len as u64;
+        self.buf[self.len..].fill(0);
+        let b = self.buf;
+        self.compress(&b, true);
         let mut out = [0u8; OUT];
-        for i in 0..8 {
-            out[i * 4..i * 4 + 4].copy_from_slice(&self.h[i].to_le_bytes());
+        for (i, x) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
         }
         out
     }
 }
 
+/// BLAKE2sp hasher. Input is split into 64-byte blocks distributed round
+/// robin over 8 leaves; the root hashes the concatenated leaf digests.
 #[derive(Clone)]
 pub struct Blake2sp {
-    s: Vec<Blake2s>,
-    r: Blake2s,
-    buf: [u8; PAR * BLOCK],
-    buflen: usize,
+    leaves: Vec<Node>,
+    stripe: [u8; STRIPE],
+    stripe_len: usize,
 }
 
 impl Default for Blake2sp {
@@ -148,105 +140,101 @@ impl Default for Blake2sp {
 
 impl Blake2sp {
     pub fn new() -> Self {
-        let mut r = Blake2s::new(0, 1);
-        r.last_node = true;
-        let mut s: Vec<Blake2s> = (0..PAR as u32).map(|i| Blake2s::new(i, 0)).collect();
-        s[PAR - 1].last_node = true;
-        Blake2sp { s, r, buf: [0; PAR * BLOCK], buflen: 0 }
+        let leaves = (0..LEAVES).map(|i| Node::new(i as u32, 0, i == LEAVES - 1)).collect();
+        Blake2sp { leaves, stripe: [0; STRIPE], stripe_len: 0 }
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
-        let mut left = self.buflen;
-        let fill = self.buf.len() - left;
-        if left > 0 && data.len() >= fill {
-            self.buf[left..].copy_from_slice(&data[..fill]);
-            for i in 0..PAR {
-                let blk: [u8; BLOCK] = self.buf[i * BLOCK..(i + 1) * BLOCK].try_into().unwrap();
-                self.s[i].update(&blk);
-            }
-            data = &data[fill..];
-            left = 0;
-        }
-        let stripe = PAR * BLOCK;
-        let full = data.len() - data.len() % stripe;
-        let lane = |i: usize, st: &mut Blake2s| {
-            let mut off = i * BLOCK;
-            while off + BLOCK <= full {
-                st.update(&data[off..off + BLOCK]);
-                off += stripe;
+    fn feed_stripes(leaves: &mut [Node], data: &[u8]) {
+        debug_assert_eq!(data.len() % STRIPE, 0);
+        // Leaves are independent, so large inputs use one thread per leaf.
+        const THREADED_FROM: usize = 1 << 20;
+        let work = |i: usize, leaf: &mut Node| {
+            for s in data.chunks_exact(STRIPE) {
+                leaf.update(&s[i * BLOCK..(i + 1) * BLOCK]);
             }
         };
-        // Lanes are independent, so large data is hashed by several threads.
-        const MIN_PARALLEL: usize = 1 << 20;
-        if full >= MIN_PARALLEL && std::thread::available_parallelism().map(|n| n.get() > 1).unwrap_or(false) {
+        if data.len() >= THREADED_FROM && std::thread::available_parallelism().is_ok_and(|n| n.get() > 1) {
             std::thread::scope(|sc| {
-                for (i, st) in self.s.iter_mut().enumerate() {
-                    sc.spawn(move || lane(i, st));
+                for (i, leaf) in leaves.iter_mut().enumerate() {
+                    sc.spawn(move || work(i, leaf));
                 }
             });
         } else {
-            for (i, st) in self.s.iter_mut().enumerate() {
-                lane(i, st);
+            for (i, leaf) in leaves.iter_mut().enumerate() {
+                work(i, leaf);
             }
         }
-        let rest = &data[full..];
-        self.buf[left..left + rest.len()].copy_from_slice(rest);
-        self.buflen = left + rest.len();
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        if self.stripe_len > 0 {
+            let n = (STRIPE - self.stripe_len).min(data.len());
+            self.stripe[self.stripe_len..self.stripe_len + n].copy_from_slice(&data[..n]);
+            self.stripe_len += n;
+            data = &data[n..];
+            if self.stripe_len < STRIPE {
+                return;
+            }
+            let s = self.stripe;
+            Self::feed_stripes(&mut self.leaves, &s);
+            self.stripe_len = 0;
+        }
+        let whole = data.len() - data.len() % STRIPE;
+        Self::feed_stripes(&mut self.leaves, &data[..whole]);
+        let rest = &data[whole..];
+        self.stripe[..rest.len()].copy_from_slice(rest);
+        self.stripe_len = rest.len();
     }
 
     pub fn finalize(&self) -> [u8; OUT] {
-        let mut st = self.clone();
-        let mut hashes = [[0u8; OUT]; PAR];
-        for i in 0..PAR {
-            if st.buflen > i * BLOCK {
-                let left = (st.buflen - i * BLOCK).min(BLOCK);
-                let blk = st.buf[i * BLOCK..i * BLOCK + left].to_vec();
-                st.s[i].update(&blk);
-            }
-            hashes[i] = st.s[i].finalize();
+        let mut root = Node::new(0, 1, true);
+        for (i, leaf) in self.leaves.iter().enumerate() {
+            let mut leaf = leaf.clone();
+            let start = (i * BLOCK).min(self.stripe_len);
+            let end = ((i + 1) * BLOCK).min(self.stripe_len);
+            leaf.update(&self.stripe[start..end]);
+            root.update(&leaf.finalize());
         }
-        for h in &hashes {
-            st.r.update(h);
-        }
-        st.r.finalize()
+        root.finalize()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn empty() {
-        let h = Blake2sp::new().finalize();
-        assert_eq!(
-            h,
-            [
-                0xdd, 0x0e, 0x89, 0x17, 0x76, 0x93, 0x3f, 0x43, 0xc7, 0xd0, 0x32, 0xb0, 0x8a, 0x91, 0x7e, 0x25,
-                0x74, 0x1f, 0x8a, 0xa9, 0xa1, 0x2c, 0x12, 0xe1, 0xca, 0xc8, 0x80, 0x15, 0x00, 0xf2, 0xca, 0x4f
-            ]
-        );
-    }
-    #[test]
-    fn large_parallel_equals_chunked() {
-        let data: Vec<u8> = (0..(3u32 << 20) + 77).map(|i| (i * 13 + i / 97) as u8).collect();
-        let mut whole = Blake2sp::new();
-        whole.update(&data);
-        let mut parts = Blake2sp::new();
-        for c in data.chunks(1000) {
-            parts.update(c);
-        }
-        assert_eq!(whole.finalize(), parts.finalize());
+
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]
-    fn chunked_equals_whole() {
-        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let mut a = Blake2sp::new();
-        a.update(&data);
-        let mut b = Blake2sp::new();
-        for c in data.chunks(37) {
-            b.update(c);
+    fn blake2s_rfc7693() {
+        // Plain BLAKE2s-256 ("abc") from RFC 7693 Appendix B.
+        let mut n = Node::new(0, 0, false);
+        n.h = IV;
+        n.h[0] ^= 0x0101_0020;
+        n.update(b"abc");
+        assert_eq!(hex(&n.finalize()), "508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982");
+    }
+
+    #[test]
+    fn empty() {
+        assert_eq!(hex(&Blake2sp::new().finalize()), "dd0e891776933f43c7d032b08a917e25741f8aa9a12c12e1cac8801500f2ca4f");
+    }
+
+    #[test]
+    fn split_points_agree() {
+        let data: Vec<u8> = (0..(3u32 << 20) + 77).map(|i| (i * 13 + i / 97) as u8).collect();
+        let mut whole = Blake2sp::new();
+        whole.update(&data);
+        let expect = whole.finalize();
+        for step in [1usize, 37, 64, 512, 1000] {
+            let mut h = Blake2sp::new();
+            for c in data[..20_000].chunks(step) {
+                h.update(c);
+            }
+            h.update(&data[20_000..]);
+            assert_eq!(h.finalize(), expect, "step {step}");
         }
-        assert_eq!(a.finalize(), b.finalize());
     }
 }
